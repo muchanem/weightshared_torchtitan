@@ -7,14 +7,21 @@
 # Copyright (c) Meta Platforms, Inc. All Rights Reserved.
 
 
-from dataclasses import dataclass
-
+from dataclasses import dataclass, field
+from typing import Optional, List
 from torch import nn
 
 from torchtitan.config import JobConfig
 from torchtitan.protocols.train_spec import BaseModelArgs
 from torchtitan.tools.logging import logger
 
+@dataclass
+class SharedAttnArgs:
+    qkv_sharing: Optional[List[List[str]]] = None
+    head_sharing: bool = False
+    grouping: Optional[int] = None
+    rank: Optional[int] = None
+    two_step: bool = False
 
 @dataclass
 class TransformerModelArgs(BaseModelArgs):
@@ -36,6 +43,7 @@ class TransformerModelArgs(BaseModelArgs):
     use_flex_attn: bool = False
     attn_mask_type: str = "causal"
     eos_id: int = 0
+    shared_attn: SharedAttnArgs = field(default_factory=SharedAttnArgs)
 
     def update_from_config(self, job_config: JobConfig, **kwargs) -> None:
         seq_len = job_config.training.seq_len
