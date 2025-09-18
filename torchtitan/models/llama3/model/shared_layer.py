@@ -1,12 +1,3 @@
-# Copyright (c) Meta Platforms, Inc. and affiliates.
-# All rights reserved.
-#
-# This source code is licensed under the BSD-style license found in the
-# LICENSE file in the root directory of this source tree.
-#
-# Copyright (c) Meta Platforms, Inc. All Rights Reserved.
-
-
 import torch
 import torch.nn.functional as F
 from torch import nn
@@ -15,10 +6,58 @@ from torchtitan.models.attention import build_attention, init_attention_mask
 from torchtitan.protocols.train_spec import ModelProtocol
 
 from .args import TransformerModelArgs
-from .shared_layer import TransformerBlock as SharedBlock
-
 from torchtitan.tools.logging import logger
 import math
+from .kernels.lora import LoRA_MLP
+from .kernels.swiglu import (
+    swiglu_act_backward as swiglu_backward,
+    swiglu_act as swiglu_forward
+)
+class ScaledLoRAModule(nn.Module):
+    def __init__(self,
+        in_dim,
+        out_dim,
+        rank=8,
+        bias=False,
+        w_a_override=None,
+        w_b_override=None):
+
+        super().__init__()
+
+        self.in_dim = in_dim
+        self.out_dim = out_dim
+        self.rank = rank
+        self.alpha = rank*2
+        self.bias = bias
+
+        # LoRA params
+        if w_a_override is not None:
+            self.w_a = w_a_override
+        else:
+            self.w_a = nn.Linear(
+                in_dim,
+            rank,
+            bias=False,
+        )  # A matrix
+
+        if w_b_override is not None:
+            self.w_b = w_b_override
+        else:
+            self.w_b = nn.Linear(
+                rank,
+                out_dim,
+                bias=False,
+        )  # B matrix
+
+    def reset_parameters(self):
+        nn.init.kaiming_uniform_(self.w_a.weight, a=math.sqrt(5))
+        nn.init.zeros_(self.w_b.weight)
+
+
+    def forward(self, x):
+        #  low-rank update
+        lora = self.w_b(self.w_a(x)) * (self.alpha / self.rank)
+        return lora
 
 def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0) -> torch.Tensor:
     """
@@ -110,41 +149,6 @@ def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
     )
 
 
-def broadcast_add(base: torch.Tensor, delta: torch.Tensor,
-                  *, dim: int = -1, g: int = 1) -> torch.Tensor:
-    """
-    base  : (..., g*D, ...)          – shared projection (smaller)
-    delta : (..., H*D, ...)          – per-head LoRA delta (bigger)
-    dim   : dimension that holds g*D or H*D
-    g     : #templates shared inside each group  (g == 1 ⇒ full sharing)
-    returns a tensor shaped like `delta`, equal to broadcast(base) + delta
-    """
-    if dim < 0:
-        dim += base.dim()            # canonicalise
-
-    # ----- shapes & sanity -------------------------------------------------
-    big  = delta.shape[dim]          # H*D
-    small = base.shape[dim]          # g*D
-    assert big % small == 0,  "delta and base feature dims incompatible"
-    heads_per_group = big // small   # H / g
-    D = small // g                   # single-head feature size
-
-    # ----- reshape base to (..., g, D, ...) -------------------------------
-    new_shape = list(base.shape)
-    new_shape[dim:dim+1] = [g, D]    # split the feature dim
-    base = base.reshape(*new_shape)
-
-    # ----- expand over heads_per_group ------------------------------------
-    # insert a broadcast axis right after 'g'
-    base = base.unsqueeze(dim + 1)                              # (..., g, 1, D, ...)
-    base = base.expand(*base.shape[:dim+1], heads_per_group, D,
-                       *base.shape[dim+3:])                     # (..., g, H/g, D, ...)
-
-    # ----- flatten back to (..., H*D, ...) -------------------------------
-    flat_shape = list(delta.shape)
-    base = base.reshape(*flat_shape)   # now exactly the same shape as delta
-
-    return base + delta
 
 
 class LoRAModule(nn.Module):
@@ -154,14 +158,14 @@ class LoRAModule(nn.Module):
         rank=8,
         bias=False,
         w_a_override=None,
-        w_b_override=None):
+        w_b_override=None,
+        dtype=None):
 
         super().__init__()
 
         self.in_dim = in_dim
         self.out_dim = out_dim
         self.rank = rank
-        self.alpha = rank*2
         self.bias = bias
 
         # LoRA params
@@ -170,8 +174,9 @@ class LoRAModule(nn.Module):
         else:
             self.w_a = nn.Linear(
                 in_dim,
-            rank,
-            bias=False,
+                rank,
+                bias=False,
+                dtype=dtype
         )  # A matrix
 
         if w_b_override is not None:
@@ -181,17 +186,42 @@ class LoRAModule(nn.Module):
                 rank,
                 out_dim,
                 bias=False,
+                dtype=dtype
         )  # B matrix
 
     def reset_parameters(self):
         nn.init.kaiming_uniform_(self.w_a.weight, a=math.sqrt(5))
-        nn.init.zeros_(self.w_b.weight)
-
-
+        nn.init.kaiming_uniform_(self.w_b.weight, a=math.sqrt(5))
     def forward(self, x):
         #  low-rank update
-        lora = self.w_b(self.w_a(x)) * (self.alpha / self.rank)
+        lora = self.w_b(self.w_a(x))
         return lora
+
+def n_loras(
+    n,
+    in_dim,
+    out_dim,
+    rank=8,
+    bias=False,
+    w_a_override=None,
+    w_b_override=None,
+    dtype=None):
+        return nn.ModuleList([
+            LoRAModule(
+                in_dim=in_dim,
+                out_dim=out_dim,
+                rank=rank,
+                bias=bias,
+                w_a_override=w_a_override,
+                w_b_override=w_b_override,
+                dtype=dtype
+            )
+            for _ in range(n)
+        ])
+
+def reset_n_loras(loras: nn.ModuleList):
+    for lora in loras:
+        lora.reset_parameters()
 def str_to_attr(s: str):
     if s == 'q':
         return 'wq_base'
@@ -219,7 +249,7 @@ class Attention(nn.Module):
 
     """
 
-    def __init__(self, model_args: TransformerModelArgs):
+    def __init__(self, model_args: TransformerModelArgs, n: int):
         super().__init__()
         self.n_heads = model_args.n_heads
         self.n_kv_heads = (
@@ -235,7 +265,7 @@ class Attention(nn.Module):
         self.rank = model_args.shared_attn.rank
         self.n_rep = self.n_heads // self.n_kv_heads
         self.head_dim = model_args.dim // model_args.n_heads
-
+        rank = model_args.layer_sharing.rank
 
         if model_args.shared_attn.qkv_sharing:
             # disable GQA
@@ -250,8 +280,11 @@ class Attention(nn.Module):
                     base_dim,
                     bias=False
                 )
+
+                w_base_offsets = n_loras(n, in_dim=model_args.dim, out_dim=base_dim, bias=False, rank=rank)
                 name = str(weight_group)
                 setattr(self, name, w_base)
+                setattr(self, name+"_offsets", w_base)
         else:
             dim_mult = self.grouping if model_args.shared_attn.head_sharing else model_args.n_heads
             kv_dim_mult = dim_mult // self.n_rep
@@ -260,73 +293,85 @@ class Attention(nn.Module):
                 self.head_dim * dim_mult,
                 bias=False,
             )
+            self.wq_base_offsets = n_loras(n, in_dim=model_args.dim, out_dim=self.head_dim * dim_mult, bias=False, rank=rank)
 
             self.wk_base = nn.Linear(
                 model_args.dim,
                 self.head_dim *  kv_dim_mult,
                 bias=False,
             )
+            self.wk_base_offsets = n_loras(n, in_dim=model_args.dim, out_dim=self.head_dim*kv_dim_mult,bias=False,rank=rank)
 
             self.wv_base = nn.Linear(
                 model_args.dim,
                 self.head_dim * kv_dim_mult,
                 bias=False,
             )
+            self.wv_base_offsets = n_loras(n, in_dim=model_args.dim, out_dim=self.head_dim * kv_dim_mult, bias=False, rank=rank)
 
         if model_args.shared_attn.two_step:
-            self.head_offset = LoRAModule(
+            self.head_offset = ScaledLoRAModule(
                 model_args.dim,
                 model_args.n_heads * self.head_dim,
                 rank=model_args.shared_attn.rank,
                 bias=False
             )
+            self.head_offset_offsets = n_loras(n, in_dim=model_args.dim, out_dim=model_args.n_heads * self.head_dim, bias=False, rank=rank)
 
-            self.wq_only_offset = LoRAModule(
+            self.wq_only_offset = ScaledLoRAModule(
                 model_args.dim,
                 self.head_dim,
                 rank=model_args.shared_attn.rank,
                 bias=False
             )
+            self.wq_only_offset_offsets = n_loras(n, in_dim=model_args.dim, out_dim=self.head_dim, bias=False, rank=rank)
 
-            self.wk_only_offset = LoRAModule(
+            self.wk_only_offset = ScaledLoRAModule(
                 model_args.dim,
                 self.head_dim,
                 rank=model_args.shared_attn.rank,
                 bias=False
             )
+            self.wk_only_offset_offsets = n_loras(n, in_dim=model_args.dim, out_dim=self.head_dim, bias=False, rank=rank)
 
-            self.wv_only_offset = LoRAModule(
+            self.wv_only_offset = ScaledLoRAModule(
                 model_args.dim,
                 self.head_dim,
                 rank=model_args.shared_attn.rank,
             )
+            self.wv_only_offset_offsets = n_loras(n, in_dim=model_args.dim, out_dim=self.head_dim, bias=False, rank=rank)
+
         else:
-            self.wq_offset = LoRAModule(
+            self.wq_offset = ScaledLoRAModule(
                 model_args.dim,
                 model_args.n_heads * self.head_dim,
                 rank=model_args.shared_attn.rank,
                 bias=False
             )
+            self.wq_offset_offsets = n_loras(n, in_dim=model_args.dim, out_dim=model_args.n_heads * self.head_dim, bias=False, rank=rank)
 
 
-            self.wk_offset = LoRAModule(
+            self.wk_offset = ScaledLoRAModule(
                 model_args.dim,
                 self.n_kv_heads * self.head_dim,
                 rank=model_args.shared_attn.rank,
                 bias=False,
             )
+            self.wk_offset_offsets = n_loras(n, in_dim=model_args.dim, out_dim=self.n_kv_heads*self.head_dim,bias=False, rank=rank)
 
 
-            self.wv_offset = LoRAModule(
+            self.wv_offset = ScaledLoRAModule(
                 model_args.dim,
                 self.n_kv_heads * self.head_dim,
                 rank=model_args.shared_attn.rank,
                 bias=False,
             )
+            self.wv_offset_offsets = n_loras(n, in_dim=model_args.dim, out_dim=self.n_kv_heads * self.head_dim, bias=False, rank=rank)
 
         self.wo = nn.Linear(
             model_args.n_heads * self.head_dim, model_args.dim, bias=False
         )
+        self.wo_offsets = n_loras(n, in_dim=model_args.dim, out_dim=self.n_kv_heads * self.head_dim, bias=False, rank=rank)
         self.sdpa = build_attention(model_args.use_flex_attn, model_args.attn_mask_type)
 
     def init_weights(self, init_std: float):
@@ -334,20 +379,54 @@ class Attention(nn.Module):
             for weight_group in self.qkv_sharing:
                 name = str(weight_group)
                 nn.init.trunc_normal_(getattr(self, name).weight, mean=0.0, std=0.02)
+                reset_n_loras(getattr(self, name+"_offsets"))
 
         else:
             for linear in (self.wq_base, self.wk_base, self.wv_base):
                 nn.init.trunc_normal_(linear.weight, mean=0.0, std=0.02)
+            reset_n_loras(self.wq_base_offsets)
+            reset_n_loras(self.wk_base_offsets)
+            reset_n_loras(self.wv_base_offsets)
         if self.two_step:
             for lora in (self.head_offset, self.wq_only_offset, self.wk_only_offset, self.wv_only_offset):
                 lora.reset_parameters()
+            reset_n_loras(self.head_offset_offsets)
+            reset_n_loras(self.wq_only_offset_offsets)
+            reset_n_loras(self.wk_only_offset_offsets)
+            reset_n_loras(self.wv_only_offset_offsets)
         else:
             for lora in (self.wq_offset, self.wk_offset, self.wv_offset):
                 lora.reset_parameters()
+            reset_n_loras(self.wq_offset_offsets)
+            reset_n_loras(self.wk_offset_offsets)
+            reset_n_loras(self.wv_offset_offsets)
 
         nn.init.trunc_normal_(self.wo.weight, mean=0.0, std=init_std)
+        reset_n_loras(self.wo_offsets)
 
     def forward(
+        self,
+        x: torch.Tensor,
+        freqs_cis: torch.Tensor,
+        n: int
+    ):
+        """
+        Forward pass of the attention module.
+
+        Args:
+            x (torch.Tensor): Input tensor.
+            freqs_cis (torch.Tensor): Precomputed frequency tensor.
+
+        Returns:
+            torch.Tensor: Output tensor after attention.
+
+        """
+        if n == 0:
+            return self.std_forward(x, freqs_cis)
+        else:
+            return self.offset_forward(x, freqs_cis, n)
+
+    def std_forward(
         self,
         x: torch.Tensor,
         freqs_cis: torch.Tensor,
@@ -363,7 +442,6 @@ class Attention(nn.Module):
             torch.Tensor: Output tensor after attention.
 
         """
-
         bs, seqlen, _ = x.shape
         if self.two_step:
             head_offset = self.head_offset(x)
@@ -422,6 +500,83 @@ class Attention(nn.Module):
         ).contiguous()  # (bs, seqlen, n_local_heads, head_dim)
         output = output.view(bs, seqlen, -1)
         return self.wo(output)
+
+    def offset_forward(
+        self,
+        x: torch.Tensor,
+        freqs_cis: torch.Tensor,
+        n: int
+    ):
+        """
+        Forward pass of the attention module.
+
+        Args:
+            x (torch.Tensor): Input tensor.
+            freqs_cis (torch.Tensor): Precomputed frequency tensor.
+
+        Returns:
+            torch.Tensor: Output tensor after attention.
+
+        """
+        bs, seqlen, _ = x.shape
+        if self.two_step:
+            head_offset = self.head_offset(x) + self.head_offset_offsets[n](x)
+            wq_only_offset = self.wq_only_offset(x) + self.wq_only_offset_offsets[n](x)
+            wk_only_offset = self.wk_only_offset(x) + self.wk_only_offset_offsets[n](x)
+            wv_only_offset = self.wv_only_offset(x) + self.wv_only_offset_offsets[n](x)
+
+            wq_offset = broadcast_add(wq_only_offset, head_offset).contiguous()
+            wk_offset = broadcast_add(wk_only_offset, head_offset).contiguous()
+            wv_offset = broadcast_add(wv_only_offset, head_offset).contiguous()
+        else:
+            wq_offset = self.wq_offset(x) + self.wq_offsets[n](x)
+            wk_offset = self.wk_offset(x) + self.wk_offsets[n](x)
+            wv_offset = self.wv_offset(x) + self.wv_offsets[n](x)
+
+        if self.qkv_sharing:
+            for weight_group in self.qkv_sharing:
+                val = getattr(self, str(weight_group))(x)
+                for weight in weight_group:
+                    if weight == 'q':
+                        q_base = val
+                    elif weight == 'k':
+                        k_base = val
+                    elif weight == 'v':
+                        v_base = val
+        else:
+            q_base = self.wq_base(x) + self.wq_base_offsets[n](x)
+            k_base = self.wk_base(x) + self.wk_base_offsets[n](x)
+            v_base = self.wv_base(x) + self.wv_base_offsets[n](x)
+
+        xq = broadcast_add(q_base, wq_offset, g=self.grouping)
+        xk = broadcast_add(k_base, wk_offset, g=self.grouping)
+        xv = broadcast_add(v_base, wv_offset, g=self.grouping)
+
+        # Use -1 instead of `n_heads` (or `n_kv_heads`) to infer the actual
+        # local heads from sizes of xq, xk, and xv as TP may have sharded them
+        # after the above linear ops.
+        xq = xq.view(bs, seqlen, -1, self.head_dim)
+        xk = xk.view(bs, seqlen, -1, self.head_dim)
+        xv = xv.view(bs, seqlen, -1, self.head_dim)
+
+        xq, xk = apply_rotary_emb(xq, xk, freqs_cis=freqs_cis)
+
+        # repeat k/v heads if n_kv_heads < n_heads
+        keys = repeat_kv(xk, self.n_rep)  # (bs, seqlen, n_local_heads, head_dim)
+        values = repeat_kv(xv, self.n_rep)  # (bs, seqlen, n_local_heads, head_dim)
+
+        xq = xq.transpose(1, 2)  # (bs, n_local_heads, seqlen, head_dim)
+        xk = keys.transpose(1, 2)  # (bs, n_local_heads, seqlen, head_dim)
+        xv = values.transpose(1, 2)  # (bs, n_local_heads, seqlen, head_dim)
+
+        output = self.sdpa(xq, xk, xv)
+
+        output = output.transpose(
+            1, 2
+        ).contiguous()  # (bs, seqlen, n_local_heads, head_dim)
+        output = output.view(bs, seqlen, -1)
+        return self.wo(output) + self.wo_offsets[n](output)
+
 class OldAttention(nn.Module):
     """
     Multi-head attention module.
@@ -441,7 +596,7 @@ class OldAttention(nn.Module):
 
     """
 
-    def __init__(self, model_args: TransformerModelArgs):
+    def __init__(self, model_args: TransformerModelArgs, n: int):
         super().__init__()
         self.n_heads = model_args.n_heads
         self.n_kv_heads = (
@@ -451,23 +606,48 @@ class OldAttention(nn.Module):
         )
         self.n_rep = self.n_heads // self.n_kv_heads
         self.head_dim = model_args.dim // model_args.n_heads
+        rank = model_args.layer_sharing.rank
 
         self.wq = nn.Linear(
             model_args.dim, model_args.n_heads * self.head_dim, bias=False
         )
+        self.wq_offsets = n_loras(n-1, in_dim=model_args.dim, out_dim=model_args.n_heads * self.head_dim, bias=False, rank=rank)
+
         self.wk = nn.Linear(model_args.dim, self.n_kv_heads * self.head_dim, bias=False)
+        self.wk_offsets = n_loras(n-1, in_dim=model_args.dim, out_dim=self.n_kv_heads * self.head_dim, bias=False, rank=rank)
+
         self.wv = nn.Linear(model_args.dim, self.n_kv_heads * self.head_dim, bias=False)
+        self.wv_offsets = n_loras(n-1, in_dim=model_args.dim, out_dim=self.n_kv_heads * self.head_dim, bias=False, rank=rank)
+
         self.wo = nn.Linear(
             model_args.n_heads * self.head_dim, model_args.dim, bias=False
         )
+        self.wo_offsets = n_loras(n-1, in_dim=model_args.n_heads * self.head_dim, out_dim=model_args.dim, bias=False, rank=rank)
+
         self.sdpa = build_attention(model_args.use_flex_attn, model_args.attn_mask_type)
 
     def init_weights(self, init_std: float):
         for linear in (self.wq, self.wk, self.wv):
-            nn.init.trunc_normal_(linear.weight, mean=0.0, std=0.02)
-        nn.init.trunc_normal_(self.wo.weight, mean=0.0, std=init_std)
+            linear.reset_parameters()
+        reset_n_loras(self.wq_offsets)
+        reset_n_loras(self.wk_offsets)
+        reset_n_loras(self.wv_offsets)
+
+        self.wo.reset_parameters()
+        reset_n_loras(self.wo_offsets)
 
     def forward(
+        self,
+        x: torch.Tensor,
+        freqs_cis: torch.Tensor,
+        n: int
+    ):
+        if n == 0:
+            return self.std_forward(x, freqs_cis)
+        else:
+            return self.offset_forward(x, freqs_cis, n-1)
+
+    def std_forward(
         self,
         x: torch.Tensor,
         freqs_cis: torch.Tensor,
@@ -512,6 +692,54 @@ class OldAttention(nn.Module):
         output = output.view(bs, seqlen, -1)
         return self.wo(output)
 
+    def offset_forward(
+        self,
+        x: torch.Tensor,
+        freqs_cis: torch.Tensor,
+        n: int
+    ):
+        """
+        Forward pass of the attention module.
+
+        Args:
+            x (torch.Tensor): Input tensor.
+            freqs_cis (torch.Tensor): Precomputed frequency tensor.
+
+        Returns:
+            torch.Tensor: Output tensor after attention.
+
+        """
+
+        bs, seqlen, _ = x.shape
+        xq = self.wq(x) + self.wq_offsets[n](x)
+        xk = self.wk(x) + self.wk_offsets[n](x)
+        xv = self.wv(x) + self.wv_offsets[n](x)
+
+        # Use -1 instead of `n_heads` (or `n_kv_heads`) to infer the actual
+        # local heads from sizes of xq, xk, and xv as TP may have sharded them
+        # after the above linear ops.
+        xq = xq.view(bs, seqlen, -1, self.head_dim)
+        xk = xk.view(bs, seqlen, -1, self.head_dim)
+        xv = xv.view(bs, seqlen, -1, self.head_dim)
+
+        xq, xk = apply_rotary_emb(xq, xk, freqs_cis=freqs_cis)
+
+        # repeat k/v heads if n_kv_heads < n_heads
+        keys = repeat_kv(xk, self.n_rep)  # (bs, seqlen, n_local_heads, head_dim)
+        values = repeat_kv(xv, self.n_rep)  # (bs, seqlen, n_local_heads, head_dim)
+
+        xq = xq.transpose(1, 2)  # (bs, n_local_heads, seqlen, head_dim)
+        xk = keys.transpose(1, 2)  # (bs, n_local_heads, seqlen, head_dim)
+        xv = values.transpose(1, 2)  # (bs, n_local_heads, seqlen, head_dim)
+
+        output = self.sdpa(xq, xk, xv)
+
+        output = output.transpose(
+            1, 2
+        ).contiguous()  # (bs, seqlen, n_local_heads, head_dim)
+        output = output.view(bs, seqlen, -1)
+        return self.wo(output) + self.wo_offsets[n](x)
+
 class FeedForward(nn.Module):
     """
     FeedForward module
@@ -535,6 +763,8 @@ class FeedForward(nn.Module):
         hidden_dim: int,
         multiple_of: int,
         ffn_dim_multiplier: float | None,
+        model_args: TransformerModelArgs,
+        n: int
     ):
         super().__init__()
         hidden_dim = int(2 * hidden_dim / 3)
@@ -543,17 +773,77 @@ class FeedForward(nn.Module):
             hidden_dim = int(ffn_dim_multiplier * hidden_dim)
         hidden_dim = multiple_of * ((hidden_dim + multiple_of - 1) // multiple_of)
 
-        self.w1 = nn.Linear(dim, hidden_dim, bias=False)
-        self.w2 = nn.Linear(hidden_dim, dim, bias=False)
-        self.w3 = nn.Linear(dim, hidden_dim, bias=False)
+        rank = model_args.layer_sharing.rank
 
-    def forward(self, x):
+        self.w1 = nn.Linear(dim, hidden_dim, bias=False, dtype=torch.bfloat16)
+        self.w1_offsets = n_loras(n-1, in_dim=dim, out_dim=hidden_dim, rank=rank,
+            dtype=torch.bfloat16)
+
+        self.w2 = nn.Linear(hidden_dim, dim, bias=False, dtype=torch.bfloat16)
+        self.w2_offsets = n_loras(n-1, in_dim=hidden_dim, out_dim=dim, rank=rank,
+            dtype=torch.bfloat16)
+
+        self.w3 = nn.Linear(dim, hidden_dim, bias=False, dtype=torch.bfloat16)
+        self.w3_offsets = n_loras(n-1, in_dim=dim, out_dim=hidden_dim, rank=rank,
+            dtype=torch.bfloat16)
+
+    def forward(self, x, n):
+        if n == 0:
+            return self.std_fwd(x)
+        else:
+            return self.offset_fwd(x, n-1)
+
+    def std_fwd(self, x):
         return self.w2(F.silu(self.w1(x)) * self.w3(x))
 
+    def offset_fwd(self, x, n):
+        """
+        X = x.to(torch.bfloat16)
+        upW = self.w1.weight
+        upA = self.w1_offsets[n].w_a.weight
+        upB = self.w1_offsets[n].w_b.weight
+
+        downW = self.w2.weight
+        downA = self.w2_offsets[n].w_a.weight
+        downB = self.w2_offsets[n].w_b.weight
+
+        gateW = self.w3.weight
+        gateA = self.w3_offsets[n].w_a.weight
+        gateB = self.w3_offsets[n].w_b.weight
+        out = LoRA_MLP.apply(
+            X,
+            gateW,
+            gateA,
+            gateB,
+            1.0,
+            upW,
+            upA,
+            upB,
+            1.0,
+            downW,
+            downA,
+            downB,
+            1.0,
+            swiglu_forward,
+            swiglu_backward,
+            True,
+        )
+        return out
+        """
+        w1 = self.w1(x) + self.w1_offsets[n](x)
+        w3 = self.w3(x) + self.w3_offsets[n](x)
+        w_out = F.silu(w1) * w3
+        return self.w2(w_out) + self.w2_offsets[n](w_out)
+
     def init_weights(self, init_std: float):
-        nn.init.trunc_normal_(self.w1.weight, mean=0.0, std=0.02)
+        self.w1.reset_parameters()
+        reset_n_loras(self.w1_offsets)
+
         for linear in (self.w2, self.w3):
-            nn.init.trunc_normal_(linear.weight, mean=0.0, std=init_std)
+            linear.reset_parameters()
+
+        reset_n_loras(self.w2_offsets)
+        reset_n_loras(self.w3_offsets)
 
 
 class TransformerBlock(nn.Module):
@@ -576,16 +866,19 @@ class TransformerBlock(nn.Module):
 
     """
 
-    def __init__(self, layer_id: int, model_args: TransformerModelArgs):
+    def __init__(self, layer_id: int, model_args: TransformerModelArgs, n: int):
         super().__init__()
         self.n_heads = model_args.n_heads
         self.dim = model_args.dim
-        self.attention = Attention(model_args) if model_args.shared_attn.enabled else OldAttention(model_args)
+        self.n = n
+        self.attention = Attention(model_args, n=n) if model_args.shared_attn.enabled else OldAttention(model_args, n=n)
         self.feed_forward = FeedForward(
             dim=model_args.dim,
             hidden_dim=4 * model_args.dim,
             multiple_of=model_args.multiple_of,
             ffn_dim_multiplier=model_args.ffn_dim_multiplier,
+            model_args=model_args,
+            n=n
         )
         self.attention_norm = nn.RMSNorm(model_args.dim, eps=model_args.norm_eps)
         self.ffn_norm = nn.RMSNorm(model_args.dim, eps=model_args.norm_eps)
@@ -611,8 +904,11 @@ class TransformerBlock(nn.Module):
             torch.Tensor: Output tensor after applying attention and feedforward layers.
 
         """
-        h = x + self.attention(self.attention_norm(x), freqs_cis)
-        out = h + self.feed_forward(self.ffn_norm(h))
+        for i in range(self.n):
+            h = x + self.attention(self.attention_norm(x), freqs_cis, n=i)
+            out = h + self.feed_forward(self.ffn_norm(h), n=i)
+            x = out
+
         return out
 
     def init_weights(self):
@@ -620,140 +916,3 @@ class TransformerBlock(nn.Module):
             norm.reset_parameters()
         self.attention.init_weights(self.weight_init_std)
         self.feed_forward.init_weights(self.weight_init_std)
-
-
-class Transformer(nn.Module, ModelProtocol):
-    """
-    Transformer Module
-
-    Args:
-        model_args (TransformerModelArgs): Model configuration arguments.
-
-    Attributes:
-        model_args (TransformerModelArgs): Model configuration arguments.
-        vocab_size (int): Vocabulary size.
-        n_layers (int): Number of layers in the model.
-        tok_embeddings (ParallelEmbedding): Token embeddings.
-        layers (torch.nn.ModuleList): List of Transformer blocks.
-        norm (RMSNorm): Layer normalization for the model output.
-        output (Linear): Linear layer for final output.
-        freqs_cis (torch.Tensor): Precomputed cosine and sine frequencies.
-
-    """
-
-    def __init__(self, model_args: TransformerModelArgs):
-        super().__init__()
-        self.model_args = model_args
-        self.vocab_size = model_args.vocab_size
-        self.n_layers = model_args.n_layers
-        self.layer_sharing = model_args.layer_sharing
-
-        self.tok_embeddings = nn.Embedding(model_args.vocab_size, model_args.dim)
-
-        self.register_buffer(
-            "freqs_cis", self._precompute_freqs_cis(), persistent=False
-        )
-
-        self.layers = torch.nn.ModuleDict()
-        if model_args.layer_sharing.enabled:
-            layer_id = 0
-            shared_cumu = 0
-            for shared_layers in model_args.layer_sharing.sharing:
-                if len(shared_layers) == 1:
-                    self.layers[str(layer_id)] = TransformerBlock(layer_id + shared_cumu, model_args)
-                else:
-                    self.layers[str(layer_id)] = SharedBlock(layer_id + shared_cumu, model_args, n=len(shared_layers))
-                    shared_cumu += len(shared_layers)
-
-                layer_id += 1
-        else:
-            for layer_id in range(model_args.n_layers):
-                self.layers[str(layer_id)] = TransformerBlock(layer_id, model_args)
-        self.norm = nn.RMSNorm(model_args.dim, eps=model_args.norm_eps)
-        self.output = nn.Linear(model_args.dim, model_args.vocab_size, bias=False)
-        self.init_weights()
-
-    def init_weights(
-        self,
-        buffer_device: torch.device | None = None,
-    ):
-        """
-        [Note: On ``init_weights`` vs. ``reset_parameters``]
-        Modules may define ``reset_parameters`` to initialize parameter values.
-        ``reset_parameters`` is meant to only initialize directly owned
-        parameters/buffers, not those of their child modules, and it can be
-        used to give the initial values for these tensors.
-        Separately, users may want custom initialization for their modules,
-        different from that in ``reset_parameters``. For this, we define
-        ``init_weights``. We only call it in the constructor of this
-        ``Transformer`` root module to avoid reinitializing tensors.
-        """
-        buffer_device = buffer_device or self.freqs_cis.device
-        with torch.device(buffer_device):
-            self.freqs_cis = self._precompute_freqs_cis()
-        if self.tok_embeddings is not None:
-            nn.init.normal_(self.tok_embeddings.weight)
-        for layer in self.layers.values():
-            if layer is not None:
-                layer.init_weights()
-        if self.norm is not None:
-            self.norm.reset_parameters()
-        final_out_std = self.model_args.dim**-0.5
-        cutoff_factor = 3
-        if self.output is not None:
-            nn.init.trunc_normal_(
-                self.output.weight,
-                mean=0.0,
-                std=final_out_std,
-                a=-cutoff_factor * final_out_std,
-                b=cutoff_factor * final_out_std,
-            )
-
-    def _precompute_freqs_cis(self) -> torch.Tensor:
-        return precompute_freqs_cis(
-            self.model_args.dim // self.model_args.n_heads,
-            # Need to compute until at least the max token limit for generation
-            # TODO: explain in docs/composability.md why we removed the 2x
-            # relaxing in our CP enablement PR
-            self.model_args.max_seq_len,
-            self.model_args.rope_theta,
-        )
-
-    def forward(
-        self,
-        tokens: torch.Tensor,
-        eos_id: int | None = None,
-        input_batch: torch.Tensor | None = None,
-    ):
-        """
-        Perform a forward pass through the Transformer model.
-
-        Args:
-            tokens (torch.Tensor): Input token indices if pipeline parallelism is not enabled.
-                If pipeline parallelism is enabled, this will be the input token indices
-                for the ranks on the first pipeline stage. This will be the activation of the
-                previous pipeline stage if the current rank is not on the first stage.
-            input_batch (torch.Tensor): The input batch read from the dataloader.
-                This will always be the input batch regardless of the pipeline stage.
-                This field is required for non-first PP stages to perform document
-                masking attention (to analyze the boundary of the document).
-
-        Returns:
-            torch.Tensor: Output logits after applying the Transformer model.
-
-        """
-        #logger.info(f"11: {list(self.parameters())[11], list(self.parameters())[11].shape}")
-        #logger.info(f"138: {list(self.parameters())[138], list(self.parameters())[138].shape}")
-        if self.model_args.use_flex_attn:
-            init_attention_mask(
-                input_batch if input_batch is not None else tokens, eos_id=eos_id
-            )
-
-        # passthrough for nonexistent layers, allows easy configuration of pipeline parallel stages
-        h = self.tok_embeddings(tokens) if self.tok_embeddings else tokens
-        for layer in self.layers.values():
-            h = layer(h, self.freqs_cis)
-
-        h = self.norm(h) if self.norm else h
-        output = self.output(h) if self.output else h
-        return output

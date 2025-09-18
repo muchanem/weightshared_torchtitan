@@ -10,18 +10,9 @@
 from dataclasses import dataclass, field
 from typing import Optional, List
 from torch import nn
-
-from torchtitan.config import JobConfig
+from torchtitan.config import JobConfig, SharedAttnArgs, LayerSharingArgs
 from torchtitan.protocols.train_spec import BaseModelArgs
 from torchtitan.tools.logging import logger
-
-@dataclass
-class SharedAttnArgs:
-    qkv_sharing: Optional[List[List[str]]] = None
-    head_sharing: bool = False
-    grouping: Optional[int] = None
-    rank: Optional[int] = None
-    two_step: bool = False
 
 @dataclass
 class TransformerModelArgs(BaseModelArgs):
@@ -44,6 +35,7 @@ class TransformerModelArgs(BaseModelArgs):
     attn_mask_type: str = "causal"
     eos_id: int = 0
     shared_attn: SharedAttnArgs = field(default_factory=SharedAttnArgs)
+    layer_sharing: LayerSharingArgs = field(default_factory=LayerSharingArgs)
 
     def update_from_config(self, job_config: JobConfig, **kwargs) -> None:
         seq_len = job_config.training.seq_len
@@ -67,6 +59,8 @@ class TransformerModelArgs(BaseModelArgs):
                 "PP + block causal FlexAttention support will be fixed soon."
             )
         self.max_seq_len = seq_len
+        self.shared_attn = job_config.model.shared_attn
+        self.layer_sharing = job_config.model.layer_sharing
 
     def get_nparams_and_flops(self, model: nn.Module, seq_len: int) -> tuple[int, int]:
         nparams = sum(p.numel() for p in model.parameters())

@@ -20,6 +20,8 @@ from .job_config import (
     Float8,
     Job,
     JobConfig,
+    SharedAttnArgs,
+    LayerSharingArgs,
     LRScheduler,
     Metrics,
     Model,
@@ -34,6 +36,8 @@ from .manager import ConfigManager
 
 __all__ = [
     "JobConfig",
+    "SharedAttnArgs",
+    "LayerSharingArgs",
     "ConfigManager",
     "TORCH_DTYPE_MAP",
     "Job",

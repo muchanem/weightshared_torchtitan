@@ -10,7 +10,6 @@ import sys
 
 from dataclasses import field, fields, is_dataclass, make_dataclass
 from typing import Any, Type
-
 import tyro
 
 try:

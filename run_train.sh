@@ -16,6 +16,9 @@ CONFIG_FILE=${CONFIG_FILE:-"./torchtitan/models/llama3/train_configs/debug_model
 
 TORCHFT_LIGHTHOUSE=${TORCHFT_LIGHTHOUSE:-"http://localhost:29510"}
 
+#TORCH_USE_CUDA_DSA=1 \
+#CUDA_LAUNCH_BLOCKING=1 \
+TORCH_DISTRIBUTED_DEBUG="DETAIL" \
 PYTORCH_ALLOC_CONF="expandable_segments:True" \
 TORCHFT_LIGHTHOUSE=${TORCHFT_LIGHTHOUSE} \
 torchrun --nproc_per_node=${NGPU} --rdzv_backend c10d --rdzv_endpoint="localhost:0" \

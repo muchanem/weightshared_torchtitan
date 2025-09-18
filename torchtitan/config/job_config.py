@@ -5,8 +5,22 @@
 # LICENSE file in the root directory of this source tree.
 
 from dataclasses import asdict, dataclass, field
-from typing import Any, Literal
+from typing import Any, Literal, List, Optional
 
+@dataclass
+class SharedAttnArgs:
+    enabled: bool = False
+    qkv_sharing: Optional[List[List[str]]] = None
+    head_sharing: bool = False
+    grouping: Optional[int] = None
+    rank: Optional[int] = None
+    two_step: bool = False
+
+@dataclass
+class LayerSharingArgs:
+    enabled: bool = False
+    rank: Optional[int] = None
+    sharing: Optional[List[List[int]]] = None
 
 @dataclass
 class Job:
@@ -102,6 +116,8 @@ class Model:
     If true, model definition will be printed to stdout after all model
     converters have been applied.
     """
+    shared_attn: SharedAttnArgs = field(default_factory=SharedAttnArgs)
+    layer_sharing: LayerSharingArgs = field(default_factory=LayerSharingArgs)
 
 
 @dataclass

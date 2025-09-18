@@ -3,11 +3,11 @@
 
 [job]
 dump_folder = "./outputs"
-description = "Grouped Head Sharing Debug"
+description = "Layer Sharing Debug"
 
 [profiling]
 enable_profiling = true
-save_traces_folder = "profile_trace_shared"
+save_traces_folder = "profile_trace_shared_layer"
 profile_freq = 100
 
 [metrics]
@@ -21,11 +21,18 @@ flavor = "40M"
 hf_assets_path = "./assets/hf/Qwen3-0.6B-Base"
 # converters = ["float8"]
 [model.shared_attn]
+enabled = false
 attn_sharing = true
 head_sharing = true
 grouping = 2
 rank = 8
 two_step = false
+
+[model.layer_sharing]
+enabled = true
+rank = 8
+sharing = [[0,],[1, 2, 3, 4, 5, 6, 7, 8, 9, 10,], [11,]]
+
 
 [optimizer]
 name = "AdamW"
@@ -59,7 +66,7 @@ export_dtype = "float32"
 async_mode = "disabled" # ["disabled", "async", "async_with_pinned_mem"]
 
 [activation_checkpoint]
-mode = "selective"  # ["none", "selective", "full"]
+mode = "none"  # ["none", "selective", "full"]
 selective_ac_option = "op"  # "int" = ac every positive int layer or 'op', ac based on ops policy
 
 [float8]

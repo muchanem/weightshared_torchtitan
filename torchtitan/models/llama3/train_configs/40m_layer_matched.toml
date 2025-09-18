@@ -3,11 +3,11 @@
 
 [job]
 dump_folder = "./outputs"
-description = "Grouped Head Sharing Debug"
+description = "Layer Sharing Baseline"
 
 [profiling]
 enable_profiling = true
-save_traces_folder = "profile_trace_shared"
+save_traces_folder = "profile_trace_shared_layer_matched"
 profile_freq = 100
 
 [metrics]
@@ -17,15 +17,22 @@ save_tb_folder = "tb"
 
 [model]
 name = "llama3"
-flavor = "40M"
-hf_assets_path = "./assets/hf/Qwen3-0.6B-Base"
+flavor = "40M_matched"
+hf_assets_path = "./assets/hf/Llama-3.1-8B"
 # converters = ["float8"]
 [model.shared_attn]
+enabled = false
 attn_sharing = true
 head_sharing = true
 grouping = 2
 rank = 8
 two_step = false
+
+[model.layer_sharing]
+enabled = false
+rank = 8
+sharing = [[0,],[1, 2, 3, 4, 5, 6, 7, 8, 9, 10,], [11,]]
+
 
 [optimizer]
 name = "AdamW"
@@ -36,11 +43,11 @@ eps = 1e-8
 warmup_steps = 200  # lr scheduler warm up
 
 [training]
-local_batch_size = 4
+local_batch_size = 12
 seq_len = 8192
 max_norm = 1.0  # grad norm clipping
 steps = 1000
-compile = false
+compile = true
 dataset = "c4"
 
 [parallelism]

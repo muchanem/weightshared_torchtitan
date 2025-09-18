@@ -3,11 +3,11 @@
 
 [job]
 dump_folder = "./outputs"
-description = "Grouped Head Sharing Debug"
+description = "Llama 3 8B training"
 
 [profiling]
 enable_profiling = true
-save_traces_folder = "profile_trace_shared"
+save_traces_folder = "profile_trace"
 profile_freq = 100
 
 [metrics]
@@ -20,12 +20,6 @@ name = "llama3"
 flavor = "40M"
 hf_assets_path = "./assets/hf/Qwen3-0.6B-Base"
 # converters = ["float8"]
-[model.shared_attn]
-attn_sharing = true
-head_sharing = true
-grouping = 2
-rank = 8
-two_step = false
 
 [optimizer]
 name = "AdamW"
