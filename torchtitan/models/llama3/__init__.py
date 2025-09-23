@@ -59,6 +59,15 @@ llama3_configs = {
         multiple_of=256,
         rope_theta=500000,
     ),
+    "250M_shared": TransformerModelArgs(
+        dim=1024,
+        n_layers=26,
+        n_heads=16,
+        n_kv_heads=8,
+        ffn_dim_multiplier=1.125,
+        multiple_of=256,
+        rope_theta=500000,
+    ),
     "8B": TransformerModelArgs(
         dim=4096,
         n_layers=32,

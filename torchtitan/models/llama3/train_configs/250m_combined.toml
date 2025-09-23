@@ -3,11 +3,11 @@
 
 [job]
 dump_folder = "./outputs"
-description = "Llama 3 8B training"
+description = "250m Combined Run"
 
 [profiling]
-enable_profiling = true
-save_traces_folder = "profile_trace"
+enable_profiling = false
+save_traces_folder = "profile_trace_shared_layer"
 profile_freq = 100
 
 [metrics]
@@ -17,9 +17,22 @@ save_tb_folder = "tb"
 
 [model]
 name = "llama3"
-flavor = "40M"
+flavor = "250M_shared"
 hf_assets_path = "./assets/hf/Llama-3.1-8B"
 # converters = ["float8"]
+[model.shared_attn]
+enabled = true
+attn_sharing = true
+head_sharing = true
+grouping = 1
+rank = 192
+two_step = false
+
+[model.layer_sharing]
+enabled = true
+rank = 256
+sharing = [[0,],[1, 2, 3,], [4, 5, 6,], [7, 8, 9,], [10, 11, 12,], [13, 14, 15,], [16, 17, 18,], [19, 20, 21,], [22, 23, 24,], [25,]]
+
 
 [optimizer]
 name = "AdamW"
@@ -27,14 +40,17 @@ lr = 3e-4
 eps = 1e-8
 
 [lr_scheduler]
-warmup_steps = 200  # lr scheduler warm up
+warmup_steps = 2000  # lr scheduler warm up
+decay_ratio = 0.8  # lr scheduler decay ratio, 80% of the train steps
+decay_type = "cosine"
+min_lr_factor = 0.1
 
 [training]
-local_batch_size = 4
-seq_len = 8192
+local_batch_size = 10
+seq_len = 2048
 max_norm = 1.0  # grad norm clipping
-steps = 1000
-compile = false
+steps = 77000
+compile = true
 dataset = "fw_edu"
 
 [parallelism]
@@ -45,15 +61,15 @@ pipeline_parallel_degree = 1
 context_parallel_degree = 1
 
 [checkpoint]
-enable_checkpoint = false
-folder = "checkpoint"
+enable_checkpoint = true
+folder = "250m_combined_checkpoint"
 interval = 500
 last_save_model_only = true
 export_dtype = "float32"
 async_mode = "disabled" # ["disabled", "async", "async_with_pinned_mem"]
 
 [activation_checkpoint]
-mode = "selective"  # ["none", "selective", "full"]
+mode = "none"  # ["none", "selective", "full"]
 selective_ac_option = "op"  # "int" = ac every positive int layer or 'op', ac based on ops policy
 
 [float8]

@@ -3,6 +3,7 @@
 #
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
+import glob
 
 from dataclasses import dataclass
 
@@ -31,6 +32,18 @@ def _process_c4_text(sample: dict[str, Any]) -> str:
     """Process C4 dataset sample text."""
     return sample["text"]
 
+def _load_fw_edu_dataset(dataset_path: str, split=str):
+    files = sorted(glob.glob(f"{dataset_path}/*.jsonl"))
+    if split == "train":
+        files = [f for f in files if not f.endswith(".val.jsonl")]
+    if split == "validation":
+        files = [f for f in files if f.endswith(".val.jsonl")]
+
+    return load_dataset("json", data_files=files, split="train", streaming=True)
+
+def _process_fw_edu_text(sample: dict[str, Any]) -> str:
+    """Process FW-EDU dataset sample text."""
+    return sample["text"]
 
 @dataclass
 class DatasetConfig:
@@ -56,6 +69,17 @@ DATASETS = {
         loader=partial(_load_c4_dataset, split="validation"),
         text_processor=_process_c4_text,
     ),
+    "fw_edu": DatasetConfig(
+        path="/net/projects2/interp/Efficient-LLMs/data_8gpu/fineweb_edu_10bt_shuffled",
+        loader=partial(_load_fw_edu_dataset, split="train"),
+        text_processor=_process_fw_edu_text,
+    ),
+    "fw_edu_val": DatasetConfig(
+        path="/net/projects2/interp/Efficient-LLMs/data_8gpu/fineweb_edu_10bt_shuffled",
+        loader=partial(_load_fw_edu_dataset, split="validation"),
+        text_processor=_process_fw_edu_text,
+    ),
+
 }
 
 

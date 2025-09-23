@@ -254,7 +254,7 @@ class Attention(nn.Module):
                 setattr(self, name, w_base)
         else:
             dim_mult = self.grouping if model_args.shared_attn.head_sharing else model_args.n_heads
-            kv_dim_mult = dim_mult // self.n_rep
+            kv_dim_mult = max(1, math.ceil(dim_mult / self.n_rep))
             self.wq_base = nn.Linear(
                 model_args.dim,
                 self.head_dim * dim_mult,
