@@ -68,7 +68,7 @@ llama3_configs = {
         multiple_of=256,
         rope_theta=500000,
         tying=True,
-        tie_rank=192,
+        tie_rank=608,
     ),
     "250M_unshared": TransformerModelArgs(
         dim=768,
