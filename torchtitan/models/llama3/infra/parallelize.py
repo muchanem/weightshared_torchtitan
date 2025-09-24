@@ -147,7 +147,8 @@ def parallelize_llama(
     if model.model_args.tying:
         model.down_proj = TiedLinear(model.up_proj.weight)
         model.output.weight = model.tok_embeddings.weight
-
+    if model.model_args.reg_tying:
+        model.output.weight = model.tok_embeddings.weight
     return model
 
 

@@ -651,6 +651,7 @@ class Transformer(nn.Module, ModelProtocol):
         if model_args.tying:
             self.tok_embeddings = nn.Embedding(model_args.vocab_size, model_args.tie_rank)
             self.up_proj = nn.Linear(model_args.tie_rank, model_args.dim, bias=False)
+
         else:
             self.tok_embeddings = nn.Embedding(model_args.vocab_size, model_args.dim)
 

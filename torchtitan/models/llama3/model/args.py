@@ -35,6 +35,7 @@ class TransformerModelArgs(BaseModelArgs):
     attn_mask_type: str = "causal"
     eos_id: int = 0
     tying: bool = False
+    reg_tying: bool = False
     tie_rank: int | None = None
     shared_attn: SharedAttnArgs = field(default_factory=SharedAttnArgs)
     layer_sharing: LayerSharingArgs = field(default_factory=LayerSharingArgs)

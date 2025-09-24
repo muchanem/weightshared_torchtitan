@@ -70,6 +70,16 @@ llama3_configs = {
         tying=True,
         tie_rank=192,
     ),
+    "250M_unshared": TransformerModelArgs(
+        dim=768,
+        n_layers=20,
+        n_heads=16,
+        n_kv_heads=8,
+        ffn_dim_multiplier=1.5,
+        multiple_of=256,
+        rope_theta=500000,
+        reg_tying=True,
+    ),
     "8B": TransformerModelArgs(
         dim=4096,
         n_layers=32,
