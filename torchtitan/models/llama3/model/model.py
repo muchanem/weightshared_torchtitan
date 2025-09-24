@@ -648,7 +648,12 @@ class Transformer(nn.Module, ModelProtocol):
         self.n_layers = model_args.n_layers
         self.layer_sharing = model_args.layer_sharing
 
-        self.tok_embeddings = nn.Embedding(model_args.vocab_size, model_args.dim)
+        if model_args.tying:
+            self.tok_embeddings = nn.Embedding(model_args.vocab_size, model_args.tie_rank)
+            self.up_proj = nn.Linear(model_args.tie_rank, model_args.dim, bias=False)
+        else:
+            self.tok_embeddings = nn.Embedding(model_args.vocab_size, model_args.dim)
+
 
         self.register_buffer(
             "freqs_cis", self._precompute_freqs_cis(), persistent=False
@@ -670,7 +675,11 @@ class Transformer(nn.Module, ModelProtocol):
             for layer_id in range(model_args.n_layers):
                 self.layers[str(layer_id)] = TransformerBlock(layer_id, model_args)
         self.norm = nn.RMSNorm(model_args.dim, eps=model_args.norm_eps)
-        self.output = nn.Linear(model_args.dim, model_args.vocab_size, bias=False)
+        if model_args.tying:
+            self.output = nn.Linear(model_args.tie_rank, model_args.vocab_size, bias=False)
+            self.down_proj = nn.Linear(model_args.dim, model_args.tie_rank, bias=False)
+        else:
+            self.output = nn.Linear(model_args.dim, model_args.vocab_size, bias=False)
         self.init_weights()
 
     def init_weights(
@@ -708,6 +717,15 @@ class Transformer(nn.Module, ModelProtocol):
                 a=-cutoff_factor * final_out_std,
                 b=cutoff_factor * final_out_std,
             )
+        if self.model_args.tying:
+            nn.init.trunc_normal_(
+                self.up_proj.weight,
+                mean=0.0,
+                std=final_out_std,
+                a=-cutoff_factor * final_out_std,
+                b=cutoff_factor * final_out_std,
+            )
+
 
     def _precompute_freqs_cis(self) -> torch.Tensor:
         return precompute_freqs_cis(
@@ -750,10 +768,16 @@ class Transformer(nn.Module, ModelProtocol):
             )
 
         # passthrough for nonexistent layers, allows easy configuration of pipeline parallel stages
-        h = self.tok_embeddings(tokens) if self.tok_embeddings else tokens
+        if self.model_args.tying:
+            h = self.up_proj(self.tok_embeddings(tokens))
+        else:
+            h = self.tok_embeddings(tokens) if self.tok_embeddings else tokens
         for layer in self.layers.values():
             h = layer(h, self.freqs_cis)
 
         h = self.norm(h) if self.norm else h
-        output = self.output(h) if self.output else h
+        if self.model_args.tying:
+            output = self.output(self.down_proj(h))
+        else:
+            output = self.output(h) if self.output else h
         return output

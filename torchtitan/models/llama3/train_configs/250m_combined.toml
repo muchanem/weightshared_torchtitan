@@ -25,7 +25,7 @@ enabled = true
 attn_sharing = true
 head_sharing = true
 grouping = 1
-rank = 192
+rank = 128
 two_step = false
 
 [model.layer_sharing]
@@ -54,7 +54,7 @@ compile = true
 dataset = "fw_edu"
 
 [parallelism]
-data_parallel_replicate_degree = 8
+data_parallel_replicate_degree = 4
 data_parallel_shard_degree = 1
 tensor_parallel_degree = 1
 pipeline_parallel_degree = 1
@@ -62,7 +62,7 @@ context_parallel_degree = 1
 
 [checkpoint]
 enable_checkpoint = true
-folder = "250m_combined_checkpoint"
+folder = "250m_combined_checkpoints"
 interval = 500
 last_save_model_only = true
 export_dtype = "float32"

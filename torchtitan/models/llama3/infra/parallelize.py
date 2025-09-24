@@ -12,6 +12,7 @@ from typing import Optional
 
 import torch
 import torch.nn as nn
+from torch.nn import functional as F
 from torch.distributed._composable.replicate import replicate
 from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
     checkpoint_wrapper as ptd_checkpoint_wrapper,
@@ -33,6 +34,13 @@ from torchtitan.config.job_config import ActivationCheckpoint as ACConfig
 from torchtitan.distributed import ParallelDims
 from torchtitan.tools.logging import logger
 
+class TiedLinear(nn.Module):
+    def __init__(self, tied_weight: torch.Tensor) -> None:
+        super().__init__()
+        self.tied_weight = tied_weight
+
+    def __call__(self, x: torch.Tensor) -> torch.Tensor:
+        return F.linear(x, self.tied_weight.t())
 
 def parallelize_llama(
     model: nn.Module,
@@ -135,6 +143,10 @@ def parallelize_llama(
             enable_compile=model_compile_enabled,
             enable_compiled_autograd=job_config.parallelism.enable_compiled_autograd,
         )
+
+    if model.model_args.tying:
+        model.down_proj = TiedLinear(model.up_proj.weight)
+        model.output.weight = model.tok_embeddings.weight
 
     return model
 
