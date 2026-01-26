@@ -28,6 +28,13 @@ from torchtitan.protocols.model import AttentionMasksType
 from torchtitan.protocols.train_spec import ModelProtocol
 
 from .args import Qwen3ModelArgs
+from .factorized_embedding import FactorizedEmbedding, FactorizedOutput, StandardOutput
+from .weight_sharing import (
+    AttentionSharingTransformerBlock,
+    CombinedSharingTransformerBlock,
+    SharedAttention,
+    SharedTransformerBlock,
+)
 
 
 # Adapted from https://github.com/pytorch/torchtune/blob/main/torchtune/models/qwen2/_positional_embeddings.py
@@ -452,18 +459,303 @@ class Qwen3Model(ModelProtocol):
         self.eos_id = model_args.eos_id
         self.head_dim = model_args.head_dim
 
-        self.tok_embeddings = nn.Embedding(model_args.vocab_size, model_args.dim)
+        # Check for weight sharing configuration
+        ws_config = model_args.weight_sharing
+        use_factorized_emb = (
+            ws_config is not None
+            and hasattr(ws_config, "embedding")
+            and ws_config.embedding.enabled
+        )
+        use_layer_sharing = (
+            ws_config is not None
+            and hasattr(ws_config, "layer")
+            and ws_config.layer.enabled
+        )
+        use_attention_sharing = (
+            ws_config is not None
+            and hasattr(ws_config, "attention")
+            and ws_config.attention.enabled
+        )
+
+        # Embeddings: standard or factorized
+        if use_factorized_emb:
+            d_emb = ws_config.embedding.d_emb
+            self.tok_embeddings = FactorizedEmbedding(
+                model_args.vocab_size, d_emb, model_args.dim
+            )
+            self._use_factorized_embedding = True
+        else:
+            self.tok_embeddings = nn.Embedding(model_args.vocab_size, model_args.dim)
+            self._use_factorized_embedding = False
 
         self.register_buffer(
             "rope_cache", self._precompute_rope_cache(), persistent=False
         )
 
+        # Build layers based on sharing configuration
+        # Four cases: no sharing, attention only, layer only, both
         self.layers = torch.nn.ModuleDict()
-        for layer_id in range(model_args.n_layers):
-            self.layers[str(layer_id)] = TransformerBlock(layer_id, model_args)
+        if use_layer_sharing and use_attention_sharing:
+            # Combined: layer sharing + attention sharing
+            self._build_combined_sharing_layers(
+                model_args, ws_config.layer, ws_config.attention
+            )
+        elif use_layer_sharing:
+            # Layer sharing only
+            self._build_shared_layers(model_args, ws_config.layer)
+        elif use_attention_sharing:
+            # Attention sharing only
+            self._build_attention_sharing_layers(model_args, ws_config.attention)
+        else:
+            # Standard layers (no sharing)
+            for layer_id in range(model_args.n_layers):
+                self.layers[str(layer_id)] = TransformerBlock(layer_id, model_args)
+
         self.norm = nn.RMSNorm(model_args.dim, eps=model_args.norm_eps)
 
-        self.output = nn.Linear(model_args.dim, model_args.vocab_size, bias=False)
+        # Output layer: standard, tied, or factorized tied
+        if use_factorized_emb and ws_config.embedding.tie_output:
+            self.output = FactorizedOutput(self.tok_embeddings)
+            self._output_tied = True
+        elif model_args.enable_weight_tying and not use_factorized_emb:
+            # Use StandardOutput for weight tying (avoids meta device bug)
+            self.output = StandardOutput(self.tok_embeddings)
+            self._output_tied = True
+        else:
+            self.output = nn.Linear(model_args.dim, model_args.vocab_size, bias=False)
+            self._output_tied = False
+
+    def _build_shared_layers(self, model_args: Qwen3ModelArgs, layer_config) -> None:
+        """Build transformer layers with weight sharing.
+
+        Creates shared weight sets for each layer group, then instantiates
+        SharedTransformerBlock for each layer using the appropriate shared weights.
+
+        Args:
+            model_args: Model configuration arguments.
+            layer_config: LayerSharingConfig with layer_groups and lora_rank.
+        """
+        layer_groups = layer_config.layer_groups
+        lora_rank = layer_config.lora_rank
+
+        if layer_groups is None:
+            raise ValueError(
+                "layer_groups must be specified when layer sharing is enabled"
+            )
+
+        # Validate layer_groups covers all layers exactly once
+        all_layers = set(range(model_args.n_layers))
+        grouped_layers = set()
+        for group in layer_groups:
+            for layer in group:
+                if layer in grouped_layers:
+                    raise ValueError(f"Layer {layer} assigned to multiple groups")
+                grouped_layers.add(layer)
+        if grouped_layers != all_layers:
+            raise ValueError(
+                f"layer_groups must cover all layers exactly once. "
+                f"Expected {all_layers}, got {grouped_layers}"
+            )
+
+        # Create shared weight sets for each group
+        init_std = model_args.dim ** (-0.5)
+        weight_sets = {}
+
+        for group in layer_groups:
+            group_key = tuple(group)
+            attention_weights = {
+                "wq": nn.Linear(
+                    model_args.dim, model_args.n_heads * model_args.head_dim, bias=False
+                ),
+                "wk": nn.Linear(
+                    model_args.dim,
+                    (model_args.n_kv_heads or model_args.n_heads) * model_args.head_dim,
+                    bias=False,
+                ),
+                "wv": nn.Linear(
+                    model_args.dim,
+                    (model_args.n_kv_heads or model_args.n_heads) * model_args.head_dim,
+                    bias=False,
+                ),
+                "wo": nn.Linear(
+                    model_args.n_heads * model_args.head_dim, model_args.dim, bias=False
+                ),
+            }
+            ffn_weights = {
+                "w1": nn.Linear(model_args.dim, model_args.hidden_dim, bias=False),
+                "w2": nn.Linear(model_args.hidden_dim, model_args.dim, bias=False),
+                "w3": nn.Linear(model_args.dim, model_args.hidden_dim, bias=False),
+            }
+
+            # Initialize weights
+            for w in attention_weights.values():
+                nn.init.trunc_normal_(
+                    w.weight, mean=0.0, std=init_std, a=-3 * init_std, b=3 * init_std
+                )
+            for w in ffn_weights.values():
+                nn.init.trunc_normal_(
+                    w.weight, mean=0.0, std=init_std, a=-3 * init_std, b=3 * init_std
+                )
+
+            weight_sets[group_key] = {
+                "attention": attention_weights,
+                "ffn": ffn_weights,
+            }
+
+        # Store shared weights as a module for proper parameter tracking
+        self._shared_weight_sets = nn.ModuleDict()
+        for group_key, weight_set in weight_sets.items():
+            group_name = "_".join(map(str, group_key))
+            self._shared_weight_sets[f"attn_{group_name}"] = nn.ModuleDict(
+                weight_set["attention"]
+            )
+            self._shared_weight_sets[f"ffn_{group_name}"] = nn.ModuleDict(
+                weight_set["ffn"]
+            )
+
+        # Create layers with appropriate weight sets
+        for layer_id in range(model_args.n_layers):
+            for group in layer_groups:
+                if layer_id in group:
+                    group_key = tuple(group)
+                    weight_set = weight_sets[group_key]
+                    # Use LoRA only if layer shares with others
+                    layer_lora_rank = 0 if len(group) == 1 else lora_rank
+                    self.layers[str(layer_id)] = SharedTransformerBlock(
+                        layer_id,
+                        model_args,
+                        weight_set["attention"],
+                        weight_set["ffn"],
+                        layer_lora_rank,
+                    )
+                    break
+
+    def _build_attention_sharing_layers(
+        self, model_args: Qwen3ModelArgs, attention_config
+    ) -> None:
+        """Build transformer layers with attention head sharing only.
+
+        Each layer has its own weights (no layer sharing), but uses SharedAttention
+        which shares base weights across attention heads with per-head LoRA offsets.
+
+        Args:
+            model_args: Model configuration arguments.
+            attention_config: AttentionSharingConfig with head_sharing, grouping, rank, etc.
+        """
+        for layer_id in range(model_args.n_layers):
+            self.layers[str(layer_id)] = AttentionSharingTransformerBlock(
+                layer_id, model_args, attention_config
+            )
+
+    def _build_combined_sharing_layers(
+        self, model_args: Qwen3ModelArgs, layer_config, attention_config
+    ) -> None:
+        """Build transformer layers with both layer sharing AND attention sharing.
+
+        Combines:
+        - Layer sharing: multiple layers share base weights with per-layer LoRA
+        - Attention sharing: attention heads share bases with per-head LoRA offsets
+
+        Args:
+            model_args: Model configuration arguments.
+            layer_config: LayerSharingConfig with layer_groups and lora_rank.
+            attention_config: AttentionSharingConfig for head sharing settings.
+        """
+        layer_groups = layer_config.layer_groups
+        lora_rank = layer_config.lora_rank
+
+        if layer_groups is None:
+            raise ValueError(
+                "layer_groups must be specified when layer sharing is enabled"
+            )
+
+        # Validate layer_groups covers all layers exactly once
+        all_layers = set(range(model_args.n_layers))
+        grouped_layers = set()
+        for group in layer_groups:
+            for layer in group:
+                if layer in grouped_layers:
+                    raise ValueError(f"Layer {layer} assigned to multiple groups")
+                grouped_layers.add(layer)
+        if grouped_layers != all_layers:
+            raise ValueError(
+                f"layer_groups must cover all layers exactly once. "
+                f"Expected {all_layers}, got {grouped_layers}"
+            )
+
+        # Create shared weight sets for each group
+        init_std = model_args.dim ** (-0.5)
+        weight_sets = {}
+
+        for group in layer_groups:
+            group_key = tuple(group)
+            attention_weights = {
+                "wq": nn.Linear(
+                    model_args.dim, model_args.n_heads * model_args.head_dim, bias=False
+                ),
+                "wk": nn.Linear(
+                    model_args.dim,
+                    (model_args.n_kv_heads or model_args.n_heads) * model_args.head_dim,
+                    bias=False,
+                ),
+                "wv": nn.Linear(
+                    model_args.dim,
+                    (model_args.n_kv_heads or model_args.n_heads) * model_args.head_dim,
+                    bias=False,
+                ),
+                "wo": nn.Linear(
+                    model_args.n_heads * model_args.head_dim, model_args.dim, bias=False
+                ),
+            }
+            ffn_weights = {
+                "w1": nn.Linear(model_args.dim, model_args.hidden_dim, bias=False),
+                "w2": nn.Linear(model_args.hidden_dim, model_args.dim, bias=False),
+                "w3": nn.Linear(model_args.dim, model_args.hidden_dim, bias=False),
+            }
+
+            # Initialize weights
+            for w in attention_weights.values():
+                nn.init.trunc_normal_(
+                    w.weight, mean=0.0, std=init_std, a=-3 * init_std, b=3 * init_std
+                )
+            for w in ffn_weights.values():
+                nn.init.trunc_normal_(
+                    w.weight, mean=0.0, std=init_std, a=-3 * init_std, b=3 * init_std
+                )
+
+            weight_sets[group_key] = {
+                "attention": attention_weights,
+                "ffn": ffn_weights,
+            }
+
+        # Store shared weights as a module for proper parameter tracking
+        self._shared_weight_sets = nn.ModuleDict()
+        for group_key, weight_set in weight_sets.items():
+            group_name = "_".join(map(str, group_key))
+            self._shared_weight_sets[f"attn_{group_name}"] = nn.ModuleDict(
+                weight_set["attention"]
+            )
+            self._shared_weight_sets[f"ffn_{group_name}"] = nn.ModuleDict(
+                weight_set["ffn"]
+            )
+
+        # Create layers with combined sharing
+        for layer_id in range(model_args.n_layers):
+            for group in layer_groups:
+                if layer_id in group:
+                    group_key = tuple(group)
+                    weight_set = weight_sets[group_key]
+                    # Use LoRA only if layer shares with others
+                    layer_lora_rank = 0 if len(group) == 1 else lora_rank
+                    self.layers[str(layer_id)] = CombinedSharingTransformerBlock(
+                        layer_id,
+                        model_args,
+                        weight_set["attention"],
+                        weight_set["ffn"],
+                        layer_lora_rank,
+                        attention_config,
+                    )
+                    break
 
     def init_weights(
         self,
@@ -483,19 +775,29 @@ class Qwen3Model(ModelProtocol):
         buffer_device = buffer_device or self.rope_cache.device
         with torch.device(buffer_device):
             self.rope_cache = self._precompute_rope_cache()
+
+        final_out_std = self.model_args.dim**-0.5
+        cutoff_factor = 3
+
+        # Initialize embeddings
         if self.tok_embeddings is not None:
-            nn.init.normal_(self.tok_embeddings.weight)
+            if self._use_factorized_embedding:
+                # FactorizedEmbedding has its own init_weights method
+                self.tok_embeddings.init_weights(final_out_std)
+            else:
+                nn.init.normal_(self.tok_embeddings.weight)
+
+        # Initialize layers
         for layer in self.layers.values():
             if layer is not None:
                 # pyrefly: ignore [not-callable]
                 layer.init_weights(buffer_device)
+
         if self.norm is not None:
             self.norm.reset_parameters()
-        final_out_std = self.model_args.dim**-0.5
-        cutoff_factor = 3
 
-        # If weight tying is enabled, we don't need to initialize the output layer
-        if self.output is not None:
+        # Initialize output layer (skip if tied to embeddings)
+        if self.output is not None and not self._output_tied:
             nn.init.trunc_normal_(
                 self.output.weight,
                 mean=0.0,
@@ -581,7 +883,19 @@ class Qwen3Model(ModelProtocol):
         h = self.tok_embeddings(tokens) if self.tok_embeddings else tokens
 
         for layer in self.layers.values():
-            h = layer(h, self.rope_cache, attention_masks, positions)
+            # Check if this is a weight-sharing block that needs extra args
+            # Use attribute check instead of isinstance for torch.compile compatibility
+            if getattr(layer, "_is_weight_sharing_block", False):
+                h = layer(
+                    h,
+                    self.rope_cache,
+                    attention_masks,
+                    positions,
+                    apply_rotary_emb_fn=apply_rotary_emb,
+                    repeat_kv_fn=repeat_kv,
+                )
+            else:
+                h = layer(h, self.rope_cache, attention_masks, positions)
 
         # pyrefly: ignore[not-callable, invalid-argument]
         h = self.norm(h) if self.norm else h

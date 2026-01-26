@@ -8,6 +8,7 @@
 
 
 from dataclasses import dataclass, field
+from typing import Any, Optional
 
 from torch import nn
 
@@ -47,6 +48,9 @@ class Qwen3ModelArgs(BaseModelArgs):
     moe_inter_dim: int = 768
     moe_args: MoEArgs = field(default_factory=MoEArgs)
 
+    # Weight sharing config (set from custom_config_module)
+    weight_sharing: Optional[Any] = None
+
     def update_from_config(self, job_config: JobConfig, **kwargs) -> None:
         seq_len = job_config.training.seq_len
         if seq_len > self.max_seq_len:
@@ -58,6 +62,10 @@ class Qwen3ModelArgs(BaseModelArgs):
         self.moe_args._debug_force_load_balance = (
             job_config.debug.moe_force_load_balance
         )
+
+        # Load weight sharing config if available from custom config module
+        if hasattr(job_config, "weight_sharing"):
+            self.weight_sharing = job_config.weight_sharing
 
     def get_nparams_and_flops(self, model: nn.Module, seq_len: int) -> tuple[int, int]:
         return get_moe_model_nparams_and_flops(self, model, 2 * self.head_dim, seq_len)

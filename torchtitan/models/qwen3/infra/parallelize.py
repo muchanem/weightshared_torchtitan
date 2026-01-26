@@ -59,6 +59,20 @@ def parallelize_qwen3(
     parallel_dims: ParallelDims,
     job_config: JobConfig,
 ):
+    # Validate weight sharing is not used with pipeline parallelism
+    ws_config = getattr(job_config, "weight_sharing", None)
+    if ws_config is not None:
+        ws_enabled = (
+            getattr(ws_config.attention, "enabled", False)
+            or getattr(ws_config.layer, "enabled", False)
+            or getattr(ws_config.embedding, "enabled", False)
+        )
+        if ws_enabled and parallel_dims.pp_enabled:
+            raise ValueError(
+                "Weight sharing is not compatible with pipeline parallelism. "
+                "Set parallelism.pipeline_parallel_degree = 1 to use weight sharing."
+            )
+
     assert (
         job_config.training.seq_len % parallel_dims.seq_len_divisor == 0
     ), f"""
@@ -185,10 +199,14 @@ def parallelize_qwen3(
         )
 
     # Enable weight tying after applying parallelisms
+    # Note: FactorizedOutput and StandardOutput handle weight tying internally via F.linear
+    # so we only need to do direct assignment for standard nn.Linear output layers
     # pyrefly: ignore [missing-attribute]
     if model.model_args.enable_weight_tying:
-        # pyrefly: ignore [missing-attribute]
-        model.output.weight = model.tok_embeddings.weight
+        # Check if output is a standard nn.Linear (not a tied output class)
+        if hasattr(model.output, "weight") and isinstance(model.output, nn.Linear):
+            # pyrefly: ignore [missing-attribute]
+            model.output.weight = model.tok_embeddings.weight
 
     return model
 

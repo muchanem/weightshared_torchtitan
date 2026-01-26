@@ -43,6 +43,60 @@ qwen3_args = {
         rope_theta=1000000,
         enable_weight_tying=True,
     ),
+    # Debug model for weight sharing experiments (smaller dims for fast iteration)
+    "debugmodel_weightshared": Qwen3ModelArgs(
+        vocab_size=2048,
+        max_seq_len=1024,
+        head_dim=64,
+        dim=256,
+        n_layers=8,
+        n_heads=8,
+        n_kv_heads=4,
+        qk_norm=True,
+        hidden_dim=512,
+        rope_theta=1000000,
+        enable_weight_tying=False,  # Using factorized embedding tie_output instead
+    ),
+    # Weight sharing experiment models (ported from old torchtitan llama3 configs)
+    "40M": Qwen3ModelArgs(
+        vocab_size=151936,
+        max_seq_len=8192,
+        head_dim=32,  # 512 / 16 = 32
+        dim=512,
+        n_layers=12,
+        n_heads=16,
+        n_kv_heads=8,
+        qk_norm=True,
+        hidden_dim=2048,  # ~4 * dim * 2/3 * 1.5 rounded
+        rope_theta=500000,
+        enable_weight_tying=False,
+    ),
+    "250M_shared": Qwen3ModelArgs(
+        vocab_size=151936,
+        max_seq_len=2048,
+        head_dim=64,  # 1024 / 16 = 64
+        dim=1024,
+        n_layers=20,  # Note: layer sharing will expand this virtually
+        n_heads=16,
+        n_kv_heads=8,
+        qk_norm=True,
+        hidden_dim=3072,  # ~4 * dim * 2/3 * 1.125 rounded
+        rope_theta=500000,
+        enable_weight_tying=False,  # Using factorized embedding instead
+    ),
+    "250M_unshared": Qwen3ModelArgs(
+        vocab_size=151936,
+        max_seq_len=2048,
+        head_dim=48,  # 768 / 16 = 48
+        dim=768,
+        n_layers=20,
+        n_heads=16,
+        n_kv_heads=8,
+        qk_norm=True,
+        hidden_dim=3072,  # ~4 * dim * 2/3 * 1.5 rounded
+        rope_theta=500000,
+        enable_weight_tying=True,  # Standard weight tying
+    ),
     "0.6B": Qwen3ModelArgs(
         vocab_size=151936,
         max_seq_len=4096,

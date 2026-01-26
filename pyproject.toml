@@ -10,15 +10,15 @@ authors = [
 ]
 keywords = ["pytorch", "training", "llm"]
 dependencies = [
+    # PyTorch
+    "torch",
+    "markupsafe",  # Explicit to ensure PyPI version is used
     # Stateful Dataloader
     "torchdata>=0.8.0",
-
     # Hugging Face integrations
     "datasets>=2.21.0",
-
     # Tokenization
     "tokenizers",
-
     # Miscellaneous
     "tomli>=1.1.0",
     "fsspec",
@@ -26,6 +26,7 @@ dependencies = [
     "tensorboard",
     "einops",
     "pillow",
+    "wandb>=0.24.0",
 ]
 dynamic = ["version"]
 
@@ -68,3 +69,23 @@ testpaths = ["tests"]
 project-excludes = ["torchtitan/experiments", "**/tests/**"]
 ignore-missing-imports = ["torchao.*", "torchft"]  # optional dependencies
 search-path = ["../pytorch"]  # local built pytorch
+
+[[tool.uv.index]]
+name = "pypi"
+url = "https://pypi.org/simple"
+default = true
+
+[[tool.uv.index]]
+name = "pytorch-cu130"
+url = "https://download.pytorch.org/whl/nightly/cu130"
+
+[tool.uv]
+prerelease = "allow"
+required-environments = [
+    "sys_platform == 'linux' and platform_machine == 'x86_64'",
+]
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu130" }
+triton = { index = "pytorch-cu130" }
+markupsafe = { index = "pypi" }
