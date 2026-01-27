@@ -21,8 +21,6 @@ flavor = "debugmodel_weightshared"
 name = "AdamW"
 lr = 3e-4
 eps = 1e-8
-weight_decay = 0.1
-betas = [0.9, 0.95]
 
 [lr_scheduler]
 warmup_steps = 10
