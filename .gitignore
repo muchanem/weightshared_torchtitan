@@ -45,3 +45,12 @@ Sessionx.vim
 
 # Vibe coding
 .claude
+
+# Profiler traces (ephemeral, regenerate as needed)
+**/traces/
+**/fixed_traces/
+**/*.pt.trace.json
+**/*.pt.trace.json.gz
+
+# Triton cache
+**/.triton/
