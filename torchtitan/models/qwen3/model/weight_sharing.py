@@ -518,7 +518,7 @@ class SharedFeedForward(nn.Module):
         dim: int,
         hidden_dim: int,
         lora_rank: int,
-        use_batched_lora: bool = True,
+        use_batched_lora: bool = False,  # Sequential is faster at this scale
     ):
         super().__init__()
         self.dim = dim
