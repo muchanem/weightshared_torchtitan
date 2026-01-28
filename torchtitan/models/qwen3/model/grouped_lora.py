@@ -21,7 +21,7 @@ import torch
 import torch.nn as nn
 
 
-def _compute_grouped_lora_forward(
+def _compute_grouped_lora_forward_grouped_mm(
     x: torch.Tensor,
     w_a_list: List[torch.Tensor],
     w_b_list: List[torch.Tensor],
@@ -29,8 +29,64 @@ def _compute_grouped_lora_forward(
 ) -> List[torch.Tensor]:
     """Compute multiple LoRA projections using grouped_mm.
 
-    This batches N independent LoRA computations (x @ A.T @ B.T * scale) into
-    2 grouped_mm calls instead of 2*N individual matmuls.
+    Note: This approach has overhead from x.repeat() which may outweigh benefits.
+    Prefer _compute_grouped_lora_forward_bmm for better performance.
+    """
+    n_loras = len(w_a_list)
+    if n_loras == 0:
+        return []
+
+    M = x.shape[0]
+    device = x.device
+    dtype = x.dtype
+
+    ranks = [w_a.shape[0] for w_a in w_a_list]
+    out_dims = [w_b.shape[0] for w_b in w_b_list]
+    all_same_rank = len(set(ranks)) == 1
+    all_same_out_dim = len(set(out_dims)) == 1
+
+    if all_same_rank and all_same_out_dim:
+        rank = ranks[0]
+        w_a_stack = torch.stack(w_a_list, dim=0)
+        w_b_stack = torch.stack(w_b_list, dim=0)
+        group_sizes = torch.full((n_loras,), M, dtype=torch.int32, device=device)
+        offsets = torch.cumsum(group_sizes, dim=0, dtype=torch.int32)
+        x_repeated = x.repeat(n_loras, 1)
+
+        h = torch._grouped_mm(
+            x_repeated.bfloat16(),
+            w_a_stack.bfloat16().transpose(-2, -1),
+            offs=offsets
+        )
+        out = torch._grouped_mm(
+            h,
+            w_b_stack.bfloat16().transpose(-2, -1),
+            offs=offsets
+        ).to(dtype)
+
+        outputs = []
+        for i in range(n_loras):
+            outputs.append(out[i*M:(i+1)*M] * scales[i])
+        return outputs
+    else:
+        outputs = []
+        for w_a, w_b, scale in zip(w_a_list, w_b_list, scales):
+            h = x @ w_a.t()
+            out = h @ w_b.t() * scale
+            outputs.append(out)
+        return outputs
+
+
+def _compute_grouped_lora_forward(
+    x: torch.Tensor,
+    w_a_list: List[torch.Tensor],
+    w_b_list: List[torch.Tensor],
+    scales: List[float],
+) -> List[torch.Tensor]:
+    """Compute multiple LoRA projections using batched matrix multiplication.
+
+    Uses torch.bmm to batch N independent LoRA computations into 2 batched
+    matmul calls, avoiding the input duplication overhead of grouped_mm.
 
     Args:
         x: Input tensor of shape (batch*seq, dim)
@@ -46,68 +102,43 @@ def _compute_grouped_lora_forward(
         return []
 
     M = x.shape[0]  # batch * seq_len
-    device = x.device
     dtype = x.dtype
 
     # Get dimensions for each LoRA
     ranks = [w_a.shape[0] for w_a in w_a_list]
     out_dims = [w_b.shape[0] for w_b in w_b_list]
 
-    # Check if all ranks are the same (enables simpler batching)
     all_same_rank = len(set(ranks)) == 1
     all_same_out_dim = len(set(out_dims)) == 1
 
     if all_same_rank and all_same_out_dim:
-        # Optimized path: stack all weights and use grouped_mm
         rank = ranks[0]
         out_dim = out_dims[0]
 
-        # Stack w_a weights: (n_loras, rank, in_dim)
-        w_a_stack = torch.stack(w_a_list, dim=0)
-        # Stack w_b weights: (n_loras, out_dim, rank)
-        w_b_stack = torch.stack(w_b_list, dim=0)
+        # Stack weights: (n_loras, rank, in_dim) and (n_loras, out_dim, rank)
+        w_a_stack = torch.stack(w_a_list, dim=0)  # (n_loras, rank, in_dim)
+        w_b_stack = torch.stack(w_b_list, dim=0)  # (n_loras, out_dim, rank)
 
-        # Create offsets for grouped_mm: cumulative sum of group sizes
-        # Each group has M tokens
-        group_sizes = torch.full((n_loras,), M, dtype=torch.int32, device=device)
-        offsets = torch.cumsum(group_sizes, dim=0, dtype=torch.int32)
+        # Expand x to match batch dimension: (n_loras, M, in_dim)
+        x_expanded = x.unsqueeze(0).expand(n_loras, -1, -1)
 
-        # Repeat x for each LoRA: (n_loras * M, in_dim)
-        x_repeated = x.repeat(n_loras, 1)
-
-        # First grouped_mm: x @ A.T for all LoRAs
-        # x_repeated: (n_loras * M, in_dim)
+        # Batched matmul: x @ A.T -> (n_loras, M, rank)
+        # x_expanded: (n_loras, M, in_dim)
         # w_a_stack.transpose(-2, -1): (n_loras, in_dim, rank)
-        # Result: (n_loras * M, rank)
-        h = torch._grouped_mm(
-            x_repeated.bfloat16(),
-            w_a_stack.bfloat16().transpose(-2, -1),
-            offs=offsets
-        )
+        h = torch.bmm(x_expanded.bfloat16(), w_a_stack.bfloat16().transpose(-2, -1))
 
-        # Second grouped_mm: h @ B.T for all LoRAs
-        # h: (n_loras * M, rank)
-        # w_b_stack.transpose(-2, -1): (n_loras, rank, out_dim)
-        # Result: (n_loras * M, out_dim)
-        out = torch._grouped_mm(
-            h,
-            w_b_stack.bfloat16().transpose(-2, -1),
-            offs=offsets
-        ).to(dtype)
+        # Batched matmul: h @ B.T -> (n_loras, M, out_dim)
+        out = torch.bmm(h, w_b_stack.bfloat16().transpose(-2, -1)).to(dtype)
 
         # Split and apply per-LoRA scaling
         outputs = []
         for i in range(n_loras):
-            start = i * M
-            end = (i + 1) * M
-            outputs.append(out[start:end] * scales[i])
+            outputs.append(out[i] * scales[i])
 
         return outputs
 
     else:
-        # Fallback: different ranks or output dims require separate handling
-        # Group by (rank, out_dim) and process each group
-        # For now, fall back to sequential computation
+        # Fallback for different dimensions
         outputs = []
         for w_a, w_b, scale in zip(w_a_list, w_b_list, scales):
             h = x @ w_a.t()
