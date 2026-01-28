@@ -38,6 +38,10 @@ from torchtitan.models.attention import (
 from torchtitan.protocols.model import AttentionMasksType
 
 from .args import Qwen3ModelArgs
+from .grouped_lora import (
+    grouped_ffn_lora_forward,
+    grouped_attention_head_offset_forward,
+)
 
 
 def broadcast_add(
@@ -238,6 +242,7 @@ class SharedAttention(nn.Module):
         grouping: Number of template heads per group.
         rank: LoRA rank for offset adapters.
         two_step: Use two-step decomposition (head offset + projection offset).
+        use_grouped_mm: Whether to use grouped_mm for LoRA operations.
     """
 
     def __init__(
@@ -248,6 +253,7 @@ class SharedAttention(nn.Module):
         grouping: int = 1,
         rank: int = 8,
         two_step: bool = False,
+        use_grouped_mm: bool = True,
     ):
         super().__init__()
         self.dim = model_args.dim
@@ -267,6 +273,7 @@ class SharedAttention(nn.Module):
         self.grouping = grouping if grouping else 1
         self.two_step = two_step
         self.rank = rank
+        self.use_grouped_mm = use_grouped_mm and rank > 0
 
         # QK norms (Qwen3-specific)
         if model_args.qk_norm:
@@ -405,18 +412,37 @@ class SharedAttention(nn.Module):
 
         # Compute LoRA offsets
         if self.two_step:
-            head_offset = self.head_offset(x)
-            wq_only = self.wq_only_offset(x)
-            wk_only = self.wk_only_offset(x)
-            wv_only = self.wv_only_offset(x)
+            if self.use_grouped_mm:
+                # Use grouped_mm: 4 LoRA modules -> 2 grouped_mm calls
+                lora_modules = [
+                    self.head_offset,
+                    self.wq_only_offset,
+                    self.wk_only_offset,
+                    self.wv_only_offset,
+                ]
+                head_offset, wq_only, wk_only, wv_only = grouped_attention_head_offset_forward(
+                    x, lora_modules, two_step=True
+                )
+            else:
+                head_offset = self.head_offset(x)
+                wq_only = self.wq_only_offset(x)
+                wk_only = self.wk_only_offset(x)
+                wv_only = self.wv_only_offset(x)
 
             wq_offset = broadcast_add(wq_only, head_offset).contiguous()
             wk_offset = broadcast_add(wk_only, head_offset).contiguous()
             wv_offset = broadcast_add(wv_only, head_offset).contiguous()
         else:
-            wq_offset = self.wq_offset(x)
-            wk_offset = self.wk_offset(x)
-            wv_offset = self.wv_offset(x)
+            if self.use_grouped_mm:
+                # Use grouped_mm: 3 LoRA modules -> 2 grouped_mm calls
+                lora_modules = [self.wq_offset, self.wk_offset, self.wv_offset]
+                wq_offset, wk_offset, wv_offset = grouped_attention_head_offset_forward(
+                    x, lora_modules, two_step=False
+                )
+            else:
+                wq_offset = self.wq_offset(x)
+                wk_offset = self.wk_offset(x)
+                wv_offset = self.wv_offset(x)
 
         # Combine base and offset with broadcasting
         xq = broadcast_add(q_base, wq_offset, g=self.grouping)
@@ -486,6 +512,7 @@ class SharedFeedForward(nn.Module):
         dim: Model dimension.
         hidden_dim: FFN hidden dimension.
         lora_rank: LoRA rank for per-layer adapters.
+        use_grouped_mm: Whether to use grouped_mm for LoRA operations.
     """
 
     def __init__(
@@ -494,13 +521,32 @@ class SharedFeedForward(nn.Module):
         dim: int,
         hidden_dim: int,
         lora_rank: int,
+        use_grouped_mm: bool = True,
     ):
         super().__init__()
         self.w1 = SharedLinearWithLoRA(shared_weights["w1"], dim, hidden_dim, lora_rank)
         self.w2 = SharedLinearWithLoRA(shared_weights["w2"], hidden_dim, dim, lora_rank)
         self.w3 = SharedLinearWithLoRA(shared_weights["w3"], dim, hidden_dim, lora_rank)
+        self.use_grouped_mm = use_grouped_mm and lora_rank > 0
+        self.lora_rank = lora_rank
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self.use_grouped_mm and self.lora_rank > 0:
+            return grouped_ffn_lora_forward(
+                x,
+                self.w1.shared_linear,
+                self.w2.shared_linear,
+                self.w3.shared_linear,
+                self.w1.lora.w_a.weight,
+                self.w1.lora.w_b.weight,
+                self.w1.lora.alpha / self.w1.lora.rank,
+                self.w2.lora.w_a.weight,
+                self.w2.lora.w_b.weight,
+                self.w2.lora.alpha / self.w2.lora.rank,
+                self.w3.lora.w_a.weight,
+                self.w3.lora.w_b.weight,
+                self.w3.lora.alpha / self.w3.lora.rank,
+            )
         return self.w2(F.silu(self.w1(x)) * self.w3(x))
 
     def init_weights(self, init_std: float) -> None:
@@ -941,6 +987,7 @@ class CombinedSharingAttention(nn.Module):
         shared_weights: Dict with "wq", "wk", "wv", "wo" shared linear layers.
         layer_lora_rank: LoRA rank for per-layer adapters.
         attention_config: AttentionSharingConfig for head sharing settings.
+        use_grouped_mm: Whether to use grouped_mm for LoRA operations.
     """
 
     def __init__(
@@ -949,6 +996,7 @@ class CombinedSharingAttention(nn.Module):
         shared_weights: dict,
         layer_lora_rank: int,
         attention_config,
+        use_grouped_mm: bool = True,
     ):
         super().__init__()
         self.dim = model_args.dim
@@ -969,6 +1017,7 @@ class CombinedSharingAttention(nn.Module):
         self.head_rank = attention_config.rank
         self.two_step = attention_config.two_step
         self.qkv_sharing = attention_config.qkv_sharing
+        self.use_grouped_mm = use_grouped_mm and (self.head_rank > 0 or layer_lora_rank > 0)
 
         # Shared weights with per-layer LoRA
         self.wq = SharedLinearWithLoRA(
@@ -1086,18 +1135,37 @@ class CombinedSharingAttention(nn.Module):
         # Apply head-level offsets if head sharing enabled
         if self.head_sharing:
             if self.two_step:
-                head_offset = self.head_offset(x)
-                wq_only = self.wq_only_offset(x)
-                wk_only = self.wk_only_offset(x)
-                wv_only = self.wv_only_offset(x)
+                if self.use_grouped_mm:
+                    # Use grouped_mm: 4 LoRA modules -> 2 grouped_mm calls
+                    lora_modules = [
+                        self.head_offset,
+                        self.wq_only_offset,
+                        self.wk_only_offset,
+                        self.wv_only_offset,
+                    ]
+                    head_offset, wq_only, wk_only, wv_only = grouped_attention_head_offset_forward(
+                        x, lora_modules, two_step=True
+                    )
+                else:
+                    head_offset = self.head_offset(x)
+                    wq_only = self.wq_only_offset(x)
+                    wk_only = self.wk_only_offset(x)
+                    wv_only = self.wv_only_offset(x)
 
                 wq_offset = broadcast_add(wq_only, head_offset).contiguous()
                 wk_offset = broadcast_add(wk_only, head_offset).contiguous()
                 wv_offset = broadcast_add(wv_only, head_offset).contiguous()
             else:
-                wq_offset = self.wq_head_offset(x)
-                wk_offset = self.wk_head_offset(x)
-                wv_offset = self.wv_head_offset(x)
+                if self.use_grouped_mm:
+                    # Use grouped_mm: 3 LoRA modules -> 2 grouped_mm calls
+                    lora_modules = [self.wq_head_offset, self.wk_head_offset, self.wv_head_offset]
+                    wq_offset, wk_offset, wv_offset = grouped_attention_head_offset_forward(
+                        x, lora_modules, two_step=False
+                    )
+                else:
+                    wq_offset = self.wq_head_offset(x)
+                    wk_offset = self.wk_head_offset(x)
+                    wv_offset = self.wv_head_offset(x)
 
             # Add head offsets
             xq = xq + wq_offset
