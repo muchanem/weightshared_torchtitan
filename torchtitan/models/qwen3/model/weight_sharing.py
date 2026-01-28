@@ -38,10 +38,7 @@ from torchtitan.models.attention import (
 from torchtitan.protocols.model import AttentionMasksType
 
 from .args import Qwen3ModelArgs
-from .grouped_lora import (
-    grouped_ffn_lora_forward,
-    grouped_attention_head_offset_forward,
-)
+from .batched_lora import BatchedLoRAModule
 
 
 def broadcast_add(
@@ -521,38 +518,71 @@ class SharedFeedForward(nn.Module):
         dim: int,
         hidden_dim: int,
         lora_rank: int,
-        use_grouped_mm: bool = False,
+        use_batched_lora: bool = True,
     ):
         super().__init__()
-        self.w1 = SharedLinearWithLoRA(shared_weights["w1"], dim, hidden_dim, lora_rank)
-        self.w2 = SharedLinearWithLoRA(shared_weights["w2"], hidden_dim, dim, lora_rank)
-        self.w3 = SharedLinearWithLoRA(shared_weights["w3"], dim, hidden_dim, lora_rank)
-        self.use_grouped_mm = use_grouped_mm and lora_rank > 0
+        self.dim = dim
+        self.hidden_dim = hidden_dim
         self.lora_rank = lora_rank
+        self.use_batched_lora = use_batched_lora and lora_rank > 0
+
+        # Shared base weights
+        self.w1_shared = shared_weights["w1"]
+        self.w2_shared = shared_weights["w2"]
+        self.w3_shared = shared_weights["w3"]
+
+        if self.use_batched_lora:
+            # Pre-stacked LoRA weights for w1+w3 (same input dim, same output dim)
+            # This avoids runtime torch.stack() overhead
+            self.w13_lora = BatchedLoRAModule(
+                n_loras=2,
+                in_dim=dim,
+                out_dim=hidden_dim,
+                rank=lora_rank,
+            )
+            # w2 LoRA is separate (different input dim: hidden_dim -> dim)
+            self.w2_lora = ScaledLoRAModule(hidden_dim, dim, rank=lora_rank)
+        else:
+            # Standard approach: separate LoRA modules
+            self.w1 = SharedLinearWithLoRA(shared_weights["w1"], dim, hidden_dim, lora_rank)
+            self.w2 = SharedLinearWithLoRA(shared_weights["w2"], hidden_dim, dim, lora_rank)
+            self.w3 = SharedLinearWithLoRA(shared_weights["w3"], dim, hidden_dim, lora_rank)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if self.use_grouped_mm and self.lora_rank > 0:
-            return grouped_ffn_lora_forward(
-                x,
-                self.w1.shared_linear,
-                self.w2.shared_linear,
-                self.w3.shared_linear,
-                self.w1.lora.w_a.weight,
-                self.w1.lora.w_b.weight,
-                self.w1.lora.alpha / self.w1.lora.rank,
-                self.w2.lora.w_a.weight,
-                self.w2.lora.w_b.weight,
-                self.w2.lora.alpha / self.w2.lora.rank,
-                self.w3.lora.w_a.weight,
-                self.w3.lora.w_b.weight,
-                self.w3.lora.alpha / self.w3.lora.rank,
-            )
+        if self.use_batched_lora:
+            return self._forward_batched(x)
         return self.w2(F.silu(self.w1(x)) * self.w3(x))
 
+    def _forward_batched(self, x: torch.Tensor) -> torch.Tensor:
+        """Forward with pre-stacked batched LoRA for w1+w3."""
+        batch, seq, dim = x.shape
+        x_flat = x.view(-1, dim)
+
+        # Batched w1+w3 LoRA: 2 matmuls -> 2 batched matmuls (1 kernel each)
+        lora_13 = self.w13_lora(x_flat)  # (2, M, hidden_dim)
+        w1_lora = lora_13[0]  # (M, hidden_dim)
+        w3_lora = lora_13[1]  # (M, hidden_dim)
+
+        # Base projections + LoRA
+        h1 = self.w1_shared(x_flat) + w1_lora
+        h3 = self.w3_shared(x_flat) + w3_lora
+
+        # SwiGLU activation
+        h = F.silu(h1) * h3
+
+        # w2 projection + LoRA
+        output = self.w2_shared(h) + self.w2_lora(h)
+
+        return output.view(batch, seq, self.dim)
+
     def init_weights(self, init_std: float) -> None:
-        self.w1.reset_parameters()
-        self.w2.reset_parameters()
-        self.w3.reset_parameters()
+        if self.use_batched_lora:
+            # BatchedLoRAModule initializes itself; ScaledLoRAModule needs reset
+            self.w2_lora.reset_parameters()
+        else:
+            self.w1.reset_parameters()
+            self.w2.reset_parameters()
+            self.w3.reset_parameters()
 
 
 class SharedAttentionWithLoRA(nn.Module):
