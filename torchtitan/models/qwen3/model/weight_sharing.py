@@ -253,7 +253,7 @@ class SharedAttention(nn.Module):
         grouping: int = 1,
         rank: int = 8,
         two_step: bool = False,
-        use_grouped_mm: bool = True,
+        use_grouped_mm: bool = False,
     ):
         super().__init__()
         self.dim = model_args.dim
@@ -521,7 +521,7 @@ class SharedFeedForward(nn.Module):
         dim: int,
         hidden_dim: int,
         lora_rank: int,
-        use_grouped_mm: bool = True,
+        use_grouped_mm: bool = False,
     ):
         super().__init__()
         self.w1 = SharedLinearWithLoRA(shared_weights["w1"], dim, hidden_dim, lora_rank)
@@ -996,7 +996,7 @@ class CombinedSharingAttention(nn.Module):
         shared_weights: dict,
         layer_lora_rank: int,
         attention_config,
-        use_grouped_mm: bool = True,
+        use_grouped_mm: bool = False,
     ):
         super().__init__()
         self.dim = model_args.dim
