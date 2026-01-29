@@ -283,42 +283,113 @@ For LoRA, the dimensions are identical across wq/wk/wv, so grouped GEMM offers o
 
 ## 7. Recommended Implementation Path
 
-### Phase 1: CUTLASS Two-Op LoRA (2-3 weeks)
+### REVISED APPROACH: Adopt LoRAFusion's Graph-Splitting Strategy
 
-1. **Start from**: Example 13 `B2bGemm` structure
-2. **Port to Hopper**: Use collective builders from example 48/49
-3. **Add TMA**: Reference LoRAFusion's descriptor setup
-4. **Target**: Fuse `lora_out = (x @ A.T) @ B.T` with S in registers
+**Why we're revising**: The LoRAFusion paper identifies critical trade-offs that make two-op fusion (A @ B in registers) suboptimal:
 
-**Deliverable**: PyTorch extension with forward kernel only
+1. **Register/shared memory consumption**: RF-resident fusion requires tile_N = R (256), consuming resources needed for optimal base GEMM tiling
+2. **Recomputation problem**: Full fusion either recomputes S per tile (expensive when M=8192) or requires cross-threadblock sync
+3. **S is cheap to materialize**: S has shape (M, R) = 4.2 MB, much smaller than X at 16.8 MB
 
-### Phase 2: Add Base GEMM Fusion (2 weeks)
+**The LoRAFusion insight**: Split the computation graph at S (the small intermediate), not at full-sized tensors.
 
-1. **Extend epilogue**: Add base GEMM output via EVT
-2. **Or parallel compute**: Use warp specialization for independent paths
+### Phase 1: Implement LoRAFusion-Style Forward (2 weeks)
 
-**Deliverable**: Full forward pass `y = x @ W.T + (x @ A.T) @ B.T`
+**Kernel 1**: `S = dropout(X) @ A`
+- Standard small GEMM (output is M × R)
+- Can use cuBLAS or simple Triton kernel
+- Low optimization priority (memory-bound anyway)
+
+**Kernel 2**: `Y = X @ W + S @ B * alpha` (horizontally fused)
+- Base GEMM (X @ W) uses optimal tiling without R constraint
+- LoRA contribution (S @ B) fused in accumulator or epilogue
+- Add happens in registers, no separate add kernel
+
+**Reference**: `lorafusion/ops/triton_ops/fused_lora_xw_sb.py`
+
+### Phase 2: Port to CUTLASS/Hopper (2-3 weeks)
+
+Options:
+- **Option A**: Use LoRAFusion's Triton kernels directly (faster to implement)
+- **Option B**: Port to CUTLASS with Hopper features for maximum performance
+
+For CUTLASS Option B:
+1. Use Collective Builder (Example 49) for base GEMM
+2. Add EVT epilogue to load S and compute S @ B + base_accum
+3. TMA for X, W, S, B loads
 
 ### Phase 3: Backward Kernels (3-4 weeks)
 
-Reference LoRAFusion's backward structure (`fused_lora_dyw_dsa.py`):
+**Extended for trainable W** (LoRAFusion has frozen W):
+
 ```
-dx = dy @ W + ds @ A * dropout_scale
-dW = dy.T @ x
-dA = ds.T @ x
-dB = dy.T @ s * alpha
-ds = dy @ B * alpha
+# New kernel needed for trainable W:
+dW = dY.T @ X          # Standard GEMM, highly optimizable
+
+# LoRAFusion kernels (can adopt directly):
+dX = dY @ W + dS @ A   # fused_lora_dyw_dsa.py
+dB = dY.T @ S * alpha  # fused_lora_dys_dyb.py (fused with dS computation)
+dS = dY @ B * alpha    # fused_lora_dys_dyb.py
+
+# Separate small GEMM:
+dA = dS.T @ X
 ```
 
-**Key challenge**: The backward requires S (intermediate from forward). Options:
-1. Save S during forward (memory cost)
-2. Recompute S during backward (compute cost)
+**Key insight**: S must be saved from forward pass for backward. This is acceptable because S is small (4.2 MB for our dimensions).
 
-### Phase 4: Integration and Optimization (2 weeks)
+### Phase 4: Integration (1-2 weeks)
 
-1. Integration with torchtitan's weight sharing
-2. Autotuning for different LoRA ranks
-3. FSDP compatibility
+1. PyTorch autograd.Function wrapper
+2. Integration with weight_sharing.py
+3. FSDP compatibility testing
+
+### Why NOT Two-Op Fusion
+
+| Concern | Impact |
+|---------|--------|
+| tile_N must equal R=256 | Constrains all tile choices |
+| Accumulator 64×256 = 64KB per warp group | High register pressure |
+| Base GEMM performance degradation | Suboptimal tiling |
+| Example 13 is Ampere, not Hopper | Significant porting effort |
+
+**LoRAFusion's approach avoids all these issues** by keeping the base GEMM unconstrained and only materializing the small S tensor.
+
+---
+
+## 7.5 Addressing LoRAFusion Paper Concerns
+
+The LoRAFusion paper identifies three critical issues with full graph fusion:
+
+### Issue 1: Recomputation When M is Large
+
+> "The first option recomputes S inside each tile of the fused kernel, but requires loading the entire A matrix repeatedly, becoming expensive when batch size M is large."
+
+**Our M = 8192** (batch=4 × seq=2048). With tile_M=64, we'd have 128 tiles. Recomputing S would mean loading A 128 times instead of once. This is prohibitive.
+
+### Issue 2: Synchronization Overhead
+
+> "The second option fuses computation and uses synchronization across thread blocks to share S, where only a single tile computes the intermediate S tiles and writes to global memory, while other tiles wait through a semaphore."
+
+This adds coordination overhead and breaks the independence that makes GPU parallelism efficient. CUTLASS example 13's RF-resident approach avoids this by requiring tile_N = R, but this creates the register pressure issue.
+
+### Issue 3: GPU Resource Consumption
+
+> "A suboptimal tiling layout or overuse of registers and shared memory can greatly degrade [base GEMM] performance."
+
+With tile_N=256 required for RF-resident two-op fusion:
+- Accumulator: 64 × 256 = 16K fp32 = 64KB per warp group
+- This limits occupancy and prevents optimal tile choices for X @ W
+
+### LoRAFusion's Solution
+
+> "Our approach takes a third option: explicitly storing and reloading S from GPU global memory. Since S is much smaller than other tensors and depends on the small LoRA rank r, the cost of reading and writing it is low."
+
+For our dimensions:
+- S = 8192 × 256 × 2 = **4.2 MB**
+- X = 8192 × 1024 × 2 = **16.8 MB**
+- Y = 8192 × 1024 × 2 = **16.8 MB**
+
+S is 4× smaller than X or Y. The trade-off of materializing S to preserve base GEMM performance is favorable.
 
 ---
 
@@ -360,14 +431,23 @@ ds = dy @ B * alpha
 
 ---
 
-## 10. Summary of Key Decisions
+## 10. Summary of Key Decisions (REVISED)
 
 | Question | Answer | Rationale |
 |----------|--------|-----------|
-| Is two-op fusion viable? | **YES** | R=256 fits in tile_N, intermediate matches |
+| Is two-op fusion viable? | **Technically yes, but NOT recommended** | Register pressure degrades base GEMM tiling |
 | CTA mismatch problem? | **NO** | Our intermediate K2=R=K1 matches |
 | Can B matrices be batched? | **NO** | Different inputs (h_wq, h_wk, h_wv) |
-| Best starting point? | CUTLASS example 13 | Directly matches our pattern |
+| Best starting point? | **LoRAFusion's fused kernels** | Graph-splitting at S is more practical |
 | Hopper features needed? | TMA, warp specialization | For competitive performance |
-| What from LoRAFusion? | TMA pattern, backward structure | But not their S-materialized approach |
-| Expected speedup? | ~2x on LoRA path | From memory traffic reduction |
+| What from LoRAFusion? | **Their entire approach** | Split at S, fuse X@W + S@B |
+| Expected speedup? | ~60-70% memory reduction | Same as LoRAFusion achieves |
+
+### Key Insight from LoRAFusion Paper
+
+**S is cheap to materialize**: With shape (M, R) = (8192, 256) = 4.2 MB, S is only 1/4 the size of X. The cost of reading/writing S is acceptable when it enables:
+1. Optimal tiling for the compute-bound base GEMM
+2. No register pressure from large tile_N constraint
+3. Simpler kernel design without recomputation or synchronization
+
+**The trade-off**: Two-op fusion saves 4.2 MB (S read) + 4.2 MB (S write) = 8.4 MB but costs optimal base GEMM performance. Given that base GEMM is compute-bound and our primary bottleneck, preserving its performance is more valuable.
