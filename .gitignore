@@ -54,3 +54,4 @@ Sessionx.vim
 
 # Triton cache
 **/.triton/
+extraction_scratchpad/*

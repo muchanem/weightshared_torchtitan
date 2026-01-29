@@ -181,9 +181,16 @@ class SharedLinearWithLoRA(nn.Module):
     This module enables weight sharing across layers while allowing each layer
     to learn unique adjustments via LoRA.
 
-    Performance optimization: Uses torch.addmm to fuse the base GEMM + LoRA add
-    into a single kernel launch. The cuBLAS beta parameter allows the add to
-    happen during the GEMM epilogue without a separate add kernel.
+    Note on performance: Various optimizations were investigated (torch.addmm
+    epilogue fusion, batched matmuls, custom Triton kernels) but none provided
+    meaningful E2E improvement because:
+    1. TorchInductor already fuses elementwise adds via Triton kernels
+    2. torch.addmm introduces Memcpy DtoD overhead that negates fusion benefits
+    3. LoRA matmuls are memory-bound (AI ~200 vs ridge point 412)
+    4. B matmuls cannot be batched (different inputs per LoRA)
+
+    A true speedup would require a fused LoRA GEMM kernel that keeps
+    intermediates in registers, plus corresponding backward kernels.
 
     Args:
         shared_linear: The shared base linear layer.
@@ -214,18 +221,10 @@ class SharedLinearWithLoRA(nn.Module):
             self.lora = ScaledLoRAModule(in_features, out_features, rank=lora_rank)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        base_output = self.shared_linear(x)
         if self.lora_rank > 0:
-            # Compute LoRA first: x @ A.T @ B.T
-            lora_out = self.lora(x)
-
-            # Fused base GEMM + add using torch.addmm
-            # addmm(bias, mat1, mat2) = bias + mat1 @ mat2
-            # The add is fused into the GEMM epilogue (no separate add kernel)
-            x_2d = x.view(-1, x.shape[-1])
-            lora_2d = lora_out.view(-1, lora_out.shape[-1])
-            y_2d = torch.addmm(lora_2d, x_2d, self.shared_linear.weight.t())
-            return y_2d.view(*x.shape[:-1], -1)
-        return self.shared_linear(x)
+            return base_output + self.lora(x)
+        return base_output
 
     def reset_parameters(self) -> None:
         if self.lora_rank > 0:
