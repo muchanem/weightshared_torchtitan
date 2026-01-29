@@ -300,42 +300,59 @@ For LoRA, the dimensions are identical across wq/wk/wv, so grouped GEMM offers o
 
 ## 7. Recommended Implementation Path
 
-### REVISED APPROACH: Adopt LoRAFusion's Graph-Splitting Strategy
+### REVISED APPROACH (Jan 29): SMEM-Staged Megakernel
 
-**Why we're revising**: The LoRAFusion paper identifies critical trade-offs that make two-op fusion (A @ B in registers) suboptimal:
+**Update**: After detailed analysis (Section 11), we now recommend a **megakernel** approach over LoRAFusion's two-kernel design. The key insight is that **kernel launch overhead (~27 us) exceeds S intermediate overhead (~1.76 us)**.
 
-1. **Register/shared memory consumption**: RF-resident fusion requires tile_N = R (256), consuming resources needed for optimal base GEMM tiling
-2. **Recomputation problem**: Full fusion either recomputes S per tile (expensive when M=8192) or requires cross-threadblock sync
-3. **S is cheap to materialize**: S has shape (M, R) = 4.2 MB, much smaller than X at 16.8 MB
+### Why Not LoRAFusion As-Is
 
-**The LoRAFusion insight**: Split the computation graph at S (the small intermediate), not at full-sized tensors.
+LoRAFusion's approach (two kernels) still has:
+- Two kernel launches (~18 us overhead)
+- X read twice (once per kernel)
+- S in GMEM (not SMEM)
 
-### Phase 1: Implement LoRAFusion-Style Forward (2 weeks)
+Our megakernel approach eliminates all of these.
 
-**Kernel 1**: `S = dropout(X) @ A`
-- Standard small GEMM (output is M × R)
-- Can use cuBLAS or simple Triton kernel
-- Low optimization priority (memory-bound anyway)
+### Phase 1: Basic Megakernel (2 weeks)
 
-**Kernel 2**: `Y = X @ W + S @ B * alpha` (horizontally fused)
-- Base GEMM (X @ W) uses optimal tiling without R constraint
-- LoRA contribution (S @ B) fused in accumulator or epilogue
-- Add happens in registers, no separate add kernel
+**Single kernel**: `Y = X @ W + (X @ A) @ B * scale`
 
-**Reference**: `lorafusion/ops/triton_ops/fused_lora_xw_sb.py`
+```
+For each M-tile:
+    Phase A: Compute S = X @ A (stream through K)
+    Store S to SMEM (64 KB, fits in 228 KB capacity)
+    __syncthreads()
 
-### Phase 2: Port to CUTLASS/Hopper (2-3 weeks)
+    Phase B: For each N-tile:
+        Load S from SMEM (fast: ~0.003 us per tile)
+        Load B slice from GMEM
+        Accumulate: Y += S @ B * scale
 
-Options:
-- **Option A**: Use LoRAFusion's Triton kernels directly (faster to implement)
-- **Option B**: Port to CUTLASS with Hopper features for maximum performance
+        Load W slice from GMEM
+        Accumulate: Y += X @ W (X may hit L2 from Phase A)
 
-For CUTLASS Option B:
-1. Use Collective Builder (Example 49) for base GEMM
-2. Add EVT epilogue to load S and compute S @ B + base_accum
-3. TMA for X, W, S, B loads
+    Store Y tiles to GMEM
+```
 
-### Phase 3: Backward Kernels (3-4 weeks)
+**Key advantage**: One launch instead of four = ~27 us saved.
+
+### Phase 2: TMA Pipelining (1-2 weeks)
+
+Add Hopper TMA for async loads:
+- Producer warps: Load X, W, A, B tiles via TMA
+- Consumer warps: Compute on ready tiles
+- Overlap memory latency with compute
+
+**Reference**: CUTLASS Example 48/49 for warp-specialized patterns
+
+### Phase 3: L2 Cache Optimization (1 week)
+
+Exploit H200's 50 MB L2 cache:
+- X (16.8 MB) fits in L2
+- After Phase A (S computation), X tiles remain in L2
+- Phase B X accesses hit L2 instead of GMEM (~3-4× faster)
+
+### Phase 4: Backward Kernels (3-4 weeks)
 
 **Extended for trainable W** (LoRAFusion has frozen W):
 
@@ -343,24 +360,34 @@ For CUTLASS Option B:
 # New kernel needed for trainable W:
 dW = dY.T @ X          # Standard GEMM, highly optimizable
 
-# LoRAFusion kernels (can adopt directly):
-dX = dY @ W + dS @ A   # fused_lora_dyw_dsa.py
-dB = dY.T @ S * alpha  # fused_lora_dys_dyb.py (fused with dS computation)
-dS = dY @ B * alpha    # fused_lora_dys_dyb.py
+# Adapt LoRAFusion patterns:
+dX = dY @ W + dS @ A   # Can fuse similar to forward
+dB = dY.T @ S * alpha  # fused_lora_dys_dyb.py pattern
+dS = dY @ B * alpha    # fused_lora_dys_dyb.py pattern
 
 # Separate small GEMM:
 dA = dS.T @ X
 ```
 
-**Key insight**: S must be saved from forward pass for backward. This is acceptable because S is small (4.2 MB for our dimensions).
+**Key insight**: S must be saved from forward pass for backward. With SMEM staging in forward, we write S to GMEM once at the end (still cheap at 4.2 MB).
 
-### Phase 4: Integration (1-2 weeks)
+### Phase 5: Integration (1-2 weeks)
 
-1. PyTorch autograd.Function wrapper
+1. PyTorch autograd.Function wrapper (or torch.library.triton_op)
 2. Integration with weight_sharing.py
-3. FSDP compatibility testing
+3. torch.compile compatibility testing
+4. FSDP gradient correctness testing
 
-### Why NOT Two-Op Fusion
+### Fallback: LoRAFusion Style
+
+If megakernel proves too complex, fall back to LoRAFusion's two-kernel approach:
+
+**Kernel 1**: `S = X @ A` (cuBLAS, optimal)
+**Kernel 2**: `Y = X @ W + S @ B` (LoRAFusion Triton kernel)
+
+Expected improvement: 72 us → ~55-60 us (1.2-1.3× speedup)
+
+### Why NOT RF-Resident Two-Op Fusion
 
 | Concern | Impact |
 |---------|--------|
@@ -368,8 +395,10 @@ dA = dS.T @ X
 | Accumulator 64×256 = 64KB per warp group | High register pressure |
 | Base GEMM performance degradation | Suboptimal tiling |
 | Example 13 is Ampere, not Hopper | Significant porting effort |
+| **Doesn't eliminate add kernel** | Still need separate add |
+| **S savings only 8.4 MB** | 6.5% of total traffic |
 
-**LoRAFusion's approach avoids all these issues** by keeping the base GEMM unconstrained and only materializing the small S tensor.
+**The megakernel approach is superior** because it addresses the actual bottlenecks (kernel launches, add fusion) rather than the perceived bottleneck (S intermediate).
 
 ---
 
@@ -448,24 +477,41 @@ S is 4× smaller than X or Y. The trade-off of materializing S to preserve base 
 
 ---
 
-## 10. Summary of Key Decisions (REVISED)
+## 10. Summary of Key Decisions (REVISED Jan 29, 2026)
 
 | Question | Answer | Rationale |
 |----------|--------|-----------|
-| Is two-op fusion viable? | **Technically yes, but NOT recommended** | Register pressure degrades base GEMM tiling |
+| Is two-op RF fusion viable? | **Technically yes, but NOT optimal** | Doesn't address main bottlenecks (launches, add) |
 | CTA mismatch problem? | **NO** | Our intermediate K2=R=K1 matches |
 | Can B matrices be batched? | **NO** | Different inputs (h_wq, h_wk, h_wv) |
-| Best starting point? | **LoRAFusion's fused kernels** | Graph-splitting at S is more practical |
-| Hopper features needed? | TMA, warp specialization | For competitive performance |
-| What from LoRAFusion? | **Their entire approach** | Split at S, fuse X@W + S@B |
-| Expected speedup? | ~60-70% memory reduction | Same as LoRAFusion achieves |
+| Best approach? | **SMEM-staged megakernel** | Addresses all bottlenecks in one kernel |
+| What about LoRAFusion? | **Good fallback, not optimal** | Still has 2 launches, X read twice |
+| Hopper features needed? | TMA, warp specialization, SMEM | For maximum performance |
+| Expected speedup? | **2.8× on LoRA+Linear path** | 72 us → ~26 us |
 
-### Key Insight from LoRAFusion Paper
+### Key Insights (Jan 29, 2026)
 
-**S is cheap to materialize**: With shape (M, R) = (8192, 256) = 4.2 MB, S is only 1/4 the size of X. The cost of reading/writing S is acceptable when it enables:
-1. Optimal tiling for the compute-bound base GEMM
-2. No register pressure from large tile_N constraint
-3. Simpler kernel design without recomputation or synchronization
+1. **S intermediate is NOT the main bottleneck**: Only 7% of LoRA A+B time (1.76 us out of 24 us)
+
+2. **Kernel launch overhead IS a main bottleneck**: ~27 us (37% of total 72 us)
+
+3. **The add kernel IS a main bottleneck**: ~15 us (21% of total)
+
+4. **X duplication is significant**: ~3.5 us (reading X twice instead of once)
+
+5. **SMEM staging is the key**: Store S in SMEM (64 KB fits in 228 KB), not GMEM
+
+6. **L2 cache helps**: X (16.8 MB) fits in H200 L2 (50 MB), enabling reuse
+
+### Why Megakernel Beats LoRAFusion
+
+| Metric | LoRAFusion (2 kernels) | Megakernel (1 kernel) |
+|--------|------------------------|----------------------|
+| Kernel launches | 2 (~18 us) | 1 (~9 us) |
+| S storage | GMEM (1.76 us) | SMEM (0.05 us) |
+| X reads | 2× (33.6 MB) | 1× + L2 (~20 MB) |
+| Add kernel | Fused | Fused |
+| **Estimated time** | **~55 us** | **~26 us** |
 
 **The trade-off**: Two-op fusion saves 4.2 MB (S read) + 4.2 MB (S write) = 8.4 MB but costs optimal base GEMM performance. Given that base GEMM is compute-bound and our primary bottleneck, preserving its performance is more valuable.
 
