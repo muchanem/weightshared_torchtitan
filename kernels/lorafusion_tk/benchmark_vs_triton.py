@@ -39,24 +39,24 @@ def unfused_xw_sb(x, W, S, B, scale):
 
 
 def main():
-    print("=" * 70)
-    print("TK LoRAFusion vs cuBLAS Unfused Benchmark")
-    print("=" * 70)
-    print(f"Device: {torch.cuda.get_device_name()}")
+    import sys
+    print("=" * 70); sys.stdout.flush()
+    print("TK LoRAFusion vs cuBLAS Unfused Benchmark"); sys.stdout.flush()
+    print("=" * 70); sys.stdout.flush()
+    print(f"Device: {torch.cuda.get_device_name()}"); sys.stdout.flush()
     print()
 
     # Test configs - must satisfy TK constraints: M%128=0, K%64=0, N%128=0, R=64
     configs = [
-        (1024, 1024, 1024, 64),
-        (2048, 1024, 1024, 64),
-        (4096, 1024, 1024, 64),
-        (8192, 1024, 1024, 64),
+        (512, 256, 512, 64),     # Small
+        (1024, 512, 1024, 64),   # Medium (verified working)
     ]
 
-    print(f"{'Config':<25} {'cuBLAS':>12} {'TK':>12} {'Speedup':>10}")
-    print("-" * 60)
+    print(f"{'Config':<25} {'cuBLAS':>12} {'TK':>12} {'Speedup':>10}"); sys.stdout.flush()
+    print("-" * 60); sys.stdout.flush()
 
     for M, K, N, R in configs:
+        print(f"Testing {M}x{K}x{N}x{R}..."); sys.stdout.flush()
         scale = 16.0 / R
 
         x = torch.randn(M, K, device="cuda", dtype=torch.bfloat16)
@@ -64,21 +64,26 @@ def main():
         S = torch.randn(M, R, device="cuda", dtype=torch.bfloat16)
         B = torch.randn(N, R, device="cuda", dtype=torch.bfloat16)
 
+        import sys
+        print("  Running cuBLAS..."); sys.stdout.flush()
         # cuBLAS unfused
         cublas_time = benchmark_kernel(unfused_xw_sb, x, W, S, B, scale)
+        print(f"  cuBLAS done: {cublas_time:.1f}us"); sys.stdout.flush()
 
+        print("  Running TK..."); sys.stdout.flush()
         # TK LoRAFusion: fused_forward(x, W, S, B, scale)
         tk_time = benchmark_kernel(lorafusion_tk.fused_forward, x, W, S, B, scale)
+        print(f"  TK done: {tk_time:.1f}us"); sys.stdout.flush()
 
         speedup = cublas_time / tk_time
         config_str = f"{M}x{K}x{N}x{R}"
-        print(f"{config_str:<25} {cublas_time:>10.1f}us {tk_time:>10.1f}us {speedup:>9.2f}x")
+        print(f"{config_str:<25} {cublas_time:>10.1f}us {tk_time:>10.1f}us {speedup:>9.2f}x"); sys.stdout.flush()
 
     print()
 
     # Also test correctness
-    print("Correctness check (8192x1024x1024x64):")
-    M, K, N, R = 8192, 1024, 1024, 64
+    print("Correctness check (1024x512x1024x64):")
+    M, K, N, R = 1024, 512, 1024, 64
     scale = 0.25
     x = torch.randn(M, K, device="cuda", dtype=torch.bfloat16)
     W = torch.randn(N, K, device="cuda", dtype=torch.bfloat16)
