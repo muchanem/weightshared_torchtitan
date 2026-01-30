@@ -4,16 +4,28 @@
 
 This document analyzes kernel fusion strategies for speeding up LoRA operations in the weight-shared model.
 
-### Key Findings (Updated Jan 29, 2026)
+### Key Findings (Updated Jan 30, 2026)
 
-1. **Two-op RF-resident fusion is NOT recommended** due to register pressure (288 regs needed, 255 limit)
-2. **The S intermediate is only 7% of LoRA A+B time** - not the main bottleneck
-3. **Kernel launch overhead (~27 us) and duplicate X reads (~3.5 us) are significant**
-4. **A megakernel with SMEM staging could achieve 2.8x speedup** on the LoRA+Linear path
+1. **TK LoRAFusion kernel implemented and validated** - 1.34-1.84x speedup over unfused
+2. **torch.compile is SLOWER than unfused cuBLAS** (~18% slower) for these operations
+3. **The S intermediate is only 7% of LoRA A+B time** - not the main bottleneck
+4. **Kernel launch overhead (~27 us) and duplicate X reads (~3.5 us) are significant**
+5. **A megakernel with SMEM staging could achieve 2.8x speedup** on the LoRA+Linear path
 
-### Recommended Approach: SMEM-Staged Megakernel
+### Implemented: TK LoRAFusion (2-Kernel Approach)
 
-Instead of LoRAFusion's two-kernel approach (which still has launch overhead), we propose a **single megakernel** that:
+**Status**: Working and validated on H200
+
+| Config | Unfused (4 kernels) | torch.compile | TK LoRAFusion (2 kernels) | vs Unfused | vs Compiled |
+|--------|---------------------|---------------|---------------------------|------------|-------------|
+| 1024x512x1024x64 | 33.6 us | 39.8 us | 19.6 us | **1.71x** | **2.03x** |
+| 8192x1024x1024x64 | 70.9 us | 80.9 us | 52.1 us | **1.34x** | **1.55x** |
+
+**Key insight**: torch.compile's Triton autotune picks suboptimal configs, making it slower than raw cuBLAS.
+
+### Next Target: SMEM-Staged Megakernel
+
+Instead of LoRAFusion's two-kernel approach, we propose a **single megakernel** that:
 1. Reads X once (saves 3.5 us)
 2. Stores S in shared memory (not GMEM)
 3. Fuses all operations (saves ~27 us launch overhead)

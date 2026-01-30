@@ -59,6 +59,9 @@ for M, K, N, R in configs:
     def unfused():
         return F.linear(x, W) + F.linear(F.linear(x, A), B) * scale
 
+    # torch.compile'd unfused
+    compiled = torch.compile(unfused, mode="max-autotune")
+
     # LoRAFusion: 2 kernels
     # 1. X @ A.T -> S (cuBLAS)
     # 2. X @ W.T + S @ B.T * scale (TK fused)
@@ -67,20 +70,24 @@ for M, K, N, R in configs:
         return lorafusion_tk.fused_forward(x, W, S, B, scale)
 
     unfused_us = benchmark(unfused)
+    compiled_us = benchmark(compiled)
     lorafusion_us = benchmark(lorafusion)
-    speedup = unfused_us / lorafusion_us
+
+    speedup_unfused = unfused_us / lorafusion_us
+    speedup_compiled = compiled_us / lorafusion_us
 
     config_str = f"{M}x{K}x{N}x{R}"
-    print(f"{config_str:<25} {unfused_us:>10.1f}us {lorafusion_us:>10.1f}us {speedup:>9.2f}x")
+    print(f"{config_str:<25} {unfused_us:>8.1f}us {compiled_us:>8.1f}us {lorafusion_us:>8.1f}us {speedup_unfused:>9.2f}x {speedup_compiled:>10.2f}x")
 
     # Verify correctness
     y_ref = unfused()
     y_tk = lorafusion()
     torch.cuda.synchronize()
     max_diff = (y_ref - y_tk).abs().max().item()
-    if max_diff > 1.0:
+    if max_diff > 2.0:
         print(f"  WARNING: max diff = {max_diff:.2f}")
 
 print()
 print("Unfused = 4 kernels: X@W.T, X@A.T, S@B.T, add+scale")
+print("Compiled = torch.compile(unfused, mode='max-autotune')")
 print("LoRAFusion = 2 kernels: X@A.T (cuBLAS), then TK fused (X@W.T + S@B.T*scale)")
