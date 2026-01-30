@@ -13,24 +13,25 @@ import torch.nn.functional as F
 import lorafusion_tk
 
 
-def benchmark_kernel(fn, *args, warmup=10, iters=100, **kwargs):
+def benchmark_kernel(fn, *args, warmup=3, iters=10, **kwargs):
     """Benchmark a kernel with CUDA event timing."""
-    # Warmup
+    # Warmup with sync between each call
     for _ in range(warmup):
         _ = fn(*args, **kwargs)
-    torch.cuda.synchronize()
+        torch.cuda.synchronize()
 
-    # Benchmark
-    start = torch.cuda.Event(enable_timing=True)
-    end = torch.cuda.Event(enable_timing=True)
-
-    start.record()
+    # Benchmark with sync between each call
+    times = []
     for _ in range(iters):
+        start = torch.cuda.Event(enable_timing=True)
+        end = torch.cuda.Event(enable_timing=True)
+        start.record()
         _ = fn(*args, **kwargs)
-    end.record()
-    torch.cuda.synchronize()
+        end.record()
+        torch.cuda.synchronize()
+        times.append(start.elapsed_time(end) * 1000)  # us
 
-    return start.elapsed_time(end) / iters * 1000  # us
+    return sum(times) / len(times)
 
 
 def unfused_xw_sb(x, W, S, B, scale):
