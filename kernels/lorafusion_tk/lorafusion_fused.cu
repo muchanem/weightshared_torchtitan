@@ -289,11 +289,13 @@ at::Tensor lorafusion_fused_forward(
     bf16* d_b = reinterpret_cast<bf16*>(b.data_ptr<c10::BFloat16>());
     bf16* d_y = reinterpret_cast<bf16*>(y.data_ptr<c10::BFloat16>());
 
-    x_global Xg{d_x, nullptr, nullptr, M, K};
-    w_global Wg{d_w, nullptr, nullptr, K, N};
-    s_global Sg{d_s, nullptr, nullptr, M, R};
-    b_global Bg{d_b, nullptr, nullptr, R, N};
-    o_global Yg{d_y, nullptr, nullptr, M, N};
+    // Global layouts: {ptr, batch_stride, depth_stride, rows, cols}
+    // Must match actual tensor shapes for TMA addressing
+    x_global Xg{d_x, nullptr, nullptr, M, K};   // X is (M, K)
+    w_global Wg{d_w, nullptr, nullptr, N, K};   // W is (N, K)
+    s_global Sg{d_s, nullptr, nullptr, M, R};   // S is (M, R)
+    b_global Bg{d_b, nullptr, nullptr, N, R};   // B is (N, R)
+    o_global Yg{d_y, nullptr, nullptr, M, N};   // Y is (M, N)
 
     // Aggregate initialize globals
     globals G{Xg, Wg, Sg, Bg, Yg, scale};
