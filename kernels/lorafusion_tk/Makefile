@@ -2,10 +2,10 @@
 # Uses the project's uv environment for Python/PyTorch paths
 
 # ThunderKittens path
-TK_PATH := /local/scratch/muchane_686487/ThunderKittens
+TK_PATH := /local/scratch/muchane_690263/ThunderKittens
 
 # Project root (for uv)
-PROJECT_ROOT := /local/scratch/muchane_686487/weightshared_torchtitan
+PROJECT_ROOT := /local/scratch/muchane_690263/weightshared_torchtitan
 
 # CUDA configuration
 CUDA_HOME ?= /usr/local/cuda
