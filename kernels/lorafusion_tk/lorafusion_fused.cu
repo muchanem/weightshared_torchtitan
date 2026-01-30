@@ -121,7 +121,19 @@ struct lorafusion_template {
                 int n_tile = blockIdx.y;                    // N tile index
                 int k_tile = args.iter;                     // K iteration (tile index)
 
-                tma::expect(args.inputs_arrived, args.input);
+                // Calculate expected bytes based on what we're loading
+                // iter 0: X + W + S + B tiles
+                // iter > 0: X + W tiles only
+                constexpr size_t x_bytes = sizeof(typename layout::x_tile) * NUM_CONSUMER_WARPGROUPS;
+                constexpr size_t w_bytes = sizeof(typename layout::w_tile);
+                constexpr size_t s_bytes = sizeof(typename layout::s_tile) * NUM_CONSUMER_WARPGROUPS;
+                constexpr size_t b_bytes = sizeof(typename layout::b_tile);
+
+                if (args.iter == 0) {
+                    tma::expect_bytes(args.inputs_arrived, x_bytes + w_bytes + s_bytes + b_bytes);
+                } else {
+                    tma::expect_bytes(args.inputs_arrived, x_bytes + w_bytes);
+                }
 
                 // Load X tiles: X is (M, K), x_tile is (64, BLOCK_K)
                 // TMA coords: {batch, depth, row_tile, col_tile}
