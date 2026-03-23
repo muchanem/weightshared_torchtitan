@@ -76,6 +76,17 @@ DATASETS = {
         loader=partial(_load_fw_edu_dataset, split="validation"),
         sample_processor=_process_fw_edu_text,
     ),
+    # High-quality data 20B tokens (local JSONL files, same format as fw_edu)
+    "hq_data_20bt": DatasetConfig(
+        path="/fsx-checkpoints/sanaelotfi/data/hq_data_20bt",
+        loader=partial(_load_fw_edu_dataset, split="train"),
+        sample_processor=_process_fw_edu_text,
+    ),
+    "hq_data_20bt_val": DatasetConfig(
+        path="/fsx-checkpoints/sanaelotfi/data/hq_data_20bt",
+        loader=partial(_load_fw_edu_dataset, split="validation"),
+        sample_processor=_process_fw_edu_text,
+    ),
 }
 
 
