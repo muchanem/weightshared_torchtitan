@@ -15,7 +15,13 @@ from torchtitan.models.common.moe import MoE, TokenChoiceTopKRouter
 from torchtitan.models.common.rmsnorm import RMSNorm
 from torchtitan.protocols.model_spec import ModelSpec
 
-from .model import Qwen3Model, Qwen3TransformerBlock
+from .model import (
+    AttentionSharingConfig,
+    FactorizedEmbeddingConfig,
+    LayerSharingConfig,
+    Qwen3Model,
+    Qwen3TransformerBlock,
+)
 from .parallelize import parallelize_qwen3
 from .state_dict_adapter import Qwen3StateDictAdapter
 
@@ -356,6 +362,95 @@ qwen3_configs = {
             backend="cos_sin",
         ),
     ),
+    # Weight sharing model sizes
+    "250M_shared": Qwen3Model.Config(
+        vocab_size=151936,
+        dim=1024,
+        n_layers=20,
+        norm=RMSNorm.Config(eps=1e-6),
+        enable_weight_tying=True,
+        tok_embeddings=Embedding.Config(),
+        output=Linear.Config(),
+        layer=Qwen3TransformerBlock.Config(
+            attention_norm=RMSNorm.Config(eps=1e-6),
+            ffn_norm=RMSNorm.Config(eps=1e-6),
+            feed_forward=FeedForward.Config(hidden_dim=3072),
+            attention=GQAttention.Config(
+                n_heads=16,
+                n_kv_heads=8,
+                head_dim=64,
+                q_norm=RMSNorm.Config(eps=1e-6),
+                k_norm=RMSNorm.Config(eps=1e-6),
+                attn_backend="sdpa",
+                rope_backend="cos_sin",
+            ),
+        ),
+        rope=RoPE.Config(
+            dim=64,
+            max_seq_len=2048,
+            theta=1000000.0,
+            backend="cos_sin",
+        ),
+    ),
+    "250M_unshared": Qwen3Model.Config(
+        vocab_size=151936,
+        dim=768,
+        n_layers=20,
+        norm=RMSNorm.Config(eps=1e-6),
+        enable_weight_tying=True,
+        tok_embeddings=Embedding.Config(),
+        output=Linear.Config(),
+        layer=Qwen3TransformerBlock.Config(
+            attention_norm=RMSNorm.Config(eps=1e-6),
+            ffn_norm=RMSNorm.Config(eps=1e-6),
+            feed_forward=FeedForward.Config(hidden_dim=3072),
+            attention=GQAttention.Config(
+                n_heads=16,
+                n_kv_heads=8,
+                head_dim=64,
+                q_norm=RMSNorm.Config(eps=1e-6),
+                k_norm=RMSNorm.Config(eps=1e-6),
+                attn_backend="sdpa",
+                rope_backend="cos_sin",
+            ),
+        ),
+        rope=RoPE.Config(
+            dim=64,
+            max_seq_len=2048,
+            theta=1000000.0,
+            backend="cos_sin",
+        ),
+    ),
+    "40M": Qwen3Model.Config(
+        vocab_size=151936,
+        dim=512,
+        n_layers=12,
+        norm=RMSNorm.Config(eps=1e-6),
+        enable_weight_tying=True,
+        tok_embeddings=Embedding.Config(),
+        output=Linear.Config(),
+        layer=Qwen3TransformerBlock.Config(
+            attention_norm=RMSNorm.Config(eps=1e-6),
+            ffn_norm=RMSNorm.Config(eps=1e-6),
+            feed_forward=FeedForward.Config(hidden_dim=1536),
+            attention=GQAttention.Config(
+                n_heads=8,
+                n_kv_heads=4,
+                head_dim=64,
+                q_norm=RMSNorm.Config(eps=1e-6),
+                k_norm=RMSNorm.Config(eps=1e-6),
+                attn_backend="sdpa",
+                rope_backend="cos_sin",
+            ),
+        ),
+        rope=RoPE.Config(
+            dim=64,
+            max_seq_len=2048,
+            theta=1000000.0,
+            backend="cos_sin",
+        ),
+    ),
+    # Qwen3-MoE models
     "235B-A22B": Qwen3Model.Config(
         vocab_size=151936,
         dim=4096,

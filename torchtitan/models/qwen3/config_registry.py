@@ -4,12 +4,15 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+import copy
+
 from torchtitan.components.checkpoint import CheckpointManager
 from torchtitan.components.lr_scheduler import LRSchedulersContainer
 from torchtitan.components.metrics import MetricsProcessor
 from torchtitan.components.optimizer import OptimizersContainer
 from torchtitan.config import (
     ActivationCheckpointConfig,
+    CompileConfig,
     ParallelismConfig,
     TrainingConfig,
 )
@@ -17,6 +20,7 @@ from torchtitan.hf_datasets.text_datasets import HuggingFaceTextDataLoader
 from torchtitan.trainer import Trainer
 
 from . import model_registry
+from .model import AttentionSharingConfig, FactorizedEmbeddingConfig, LayerSharingConfig
 
 
 def qwen3_debugmodel() -> Trainer.Config:
@@ -215,4 +219,161 @@ def qwen3_moe_debug() -> Trainer.Config:
         activation_checkpoint=ActivationCheckpointConfig(
             mode="selective",
         ),
+    )
+
+
+# ============================================================================
+# Weight sharing experiment configs
+# ============================================================================
+
+_LAYER_GROUPS_20L = [
+    [0],
+    [1, 2, 3],
+    [4, 5, 6],
+    [7, 8, 9],
+    [10, 11, 12],
+    [13, 14, 15],
+    [16, 17, 18],
+    [19],
+]
+
+
+def _ws_training_base(model_spec) -> Trainer.Config:
+    """Shared training config for all 250M weight sharing experiments."""
+    return Trainer.Config(
+        hf_assets_path="./assets/hf/Qwen3-0.6B-Base",
+        metrics=MetricsProcessor.Config(log_freq=10),
+        model_spec=model_spec,
+        dataloader=HuggingFaceTextDataLoader.Config(dataset="hq_data_20bt"),
+        optimizer=OptimizersContainer.Config(lr=3e-4),
+        lr_scheduler=LRSchedulersContainer.Config(
+            warmup_steps=1500,
+            decay_ratio=0.8,
+            decay_type="cosine",
+            min_lr_factor=0.1,
+        ),
+        training=TrainingConfig(
+            local_batch_size=22,
+            seq_len=2048,
+            steps=55500,
+        ),
+        parallelism=ParallelismConfig(
+            data_parallel_replicate_degree=8,
+            data_parallel_shard_degree=1,
+        ),
+        checkpoint=CheckpointManager.Config(
+            interval=500,
+            last_save_model_only=True,
+        ),
+        compile=CompileConfig(enable=True),
+    )
+
+
+def qwen3_250m_combined() -> Trainer.Config:
+    """250M with all three sharing modes: attention + layer + embedding."""
+    spec = model_registry("250M_shared")
+    spec.model.attention_sharing = AttentionSharingConfig(
+        enabled=True, head_sharing=True, grouping=1, rank=192, two_step=False,
+    )
+    spec.model.layer_sharing = LayerSharingConfig(
+        enabled=True, layer_groups=_LAYER_GROUPS_20L, lora_rank=256,
+    )
+    spec.model.factorized_embedding = FactorizedEmbeddingConfig(
+        enabled=True, d_emb=608, tie_output=True,
+    )
+    return _ws_training_base(spec)
+
+
+def qwen3_250m_unshared() -> Trainer.Config:
+    """250M baseline without weight sharing."""
+    return _ws_training_base(model_registry("250M_unshared"))
+
+
+def qwen3_250m_attention_only() -> Trainer.Config:
+    """250M with attention head sharing only."""
+    spec = model_registry("250M_shared")
+    spec.model.attention_sharing = AttentionSharingConfig(
+        enabled=True, head_sharing=True, grouping=1, rank=192,
+    )
+    return _ws_training_base(spec)
+
+
+def qwen3_250m_layer_only() -> Trainer.Config:
+    """250M with layer sharing only."""
+    spec = model_registry("250M_shared")
+    spec.model.layer_sharing = LayerSharingConfig(
+        enabled=True, layer_groups=_LAYER_GROUPS_20L, lora_rank=256,
+    )
+    return _ws_training_base(spec)
+
+
+def qwen3_250m_embedding_only() -> Trainer.Config:
+    """250M with factorized embeddings only."""
+    spec = model_registry("250M_shared")
+    spec.model.factorized_embedding = FactorizedEmbeddingConfig(
+        enabled=True, d_emb=608, tie_output=True,
+    )
+    return _ws_training_base(spec)
+
+
+def qwen3_40m_layer() -> Trainer.Config:
+    """40M with layer sharing."""
+    spec = model_registry("40M")
+    spec.model.layer_sharing = LayerSharingConfig(
+        enabled=True,
+        layer_groups=[[0], [1, 2, 3], [4, 5, 6], [7, 8, 9], [10, 11]],
+        lora_rank=128,
+    )
+    return _ws_training_base(spec)
+
+
+def qwen3_40m_grouped_head_share() -> Trainer.Config:
+    """40M with grouped attention head sharing."""
+    spec = model_registry("40M")
+    spec.model.attention_sharing = AttentionSharingConfig(
+        enabled=True, head_sharing=True, grouping=2, rank=64,
+    )
+    return _ws_training_base(spec)
+
+
+def qwen3_debug_weightshared() -> Trainer.Config:
+    """Debug model with weight sharing (for testing)."""
+    spec = model_registry("debugmodel")
+    spec.model.layer_sharing = LayerSharingConfig(
+        enabled=True,
+        layer_groups=[[0], [1, 2, 3], [4, 5, 6], [7]],
+        lora_rank=32,
+    )
+    spec.model.factorized_embedding = FactorizedEmbeddingConfig(
+        enabled=True, d_emb=128, tie_output=True,
+    )
+    return Trainer.Config(
+        hf_assets_path="./tests/assets/tokenizer",
+        metrics=MetricsProcessor.Config(log_freq=1),
+        model_spec=spec,
+        dataloader=HuggingFaceTextDataLoader.Config(dataset="c4_test"),
+        optimizer=OptimizersContainer.Config(lr=8e-4),
+        lr_scheduler=LRSchedulersContainer.Config(
+            warmup_steps=2, decay_ratio=0.8, decay_type="linear", min_lr_factor=0.0,
+        ),
+        training=TrainingConfig(local_batch_size=8, seq_len=2048, steps=10),
+        checkpoint=CheckpointManager.Config(interval=10, last_save_model_only=False),
+        activation_checkpoint=ActivationCheckpointConfig(mode="selective"),
+    )
+
+
+def qwen3_debug_unshared() -> Trainer.Config:
+    """Debug model without weight sharing (for testing)."""
+    return Trainer.Config(
+        hf_assets_path="./tests/assets/tokenizer",
+        metrics=MetricsProcessor.Config(log_freq=1),
+        model_spec=model_registry("debugmodel"),
+        dataloader=HuggingFaceTextDataLoader.Config(dataset="c4_test"),
+        optimizer=OptimizersContainer.Config(lr=8e-4),
+        lr_scheduler=LRSchedulersContainer.Config(
+            warmup_steps=2, decay_ratio=0.8, decay_type="linear", min_lr_factor=0.0,
+        ),
+        training=TrainingConfig(local_batch_size=8, seq_len=2048, steps=10),
+        checkpoint=CheckpointManager.Config(interval=10, last_save_model_only=False),
+        activation_checkpoint=ActivationCheckpointConfig(mode="selective"),
     )
