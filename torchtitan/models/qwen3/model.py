@@ -18,7 +18,7 @@ from torchtitan.models.utils import get_moe_model_nparams_and_flops
 from torchtitan.protocols.module import Module, ModuleDict
 from torchtitan.tools.logging import logger
 
-from .model import (
+from .ws_modules import (
     AttentionSharingTransformerBlock,
     CombinedSharingTransformerBlock,
     FactorizedEmbedding,
