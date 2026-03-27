@@ -8,15 +8,68 @@ import contextlib
 import os
 import pickle
 import time
+from dataclasses import dataclass
 
 import torch
-
-from torchtitan.config import Profiling as ProfilingConfig
 from torchtitan.tools.logging import logger
 from torchtitan.tools.utils import device_module
 
 # how much memory allocation/free ops to record in memory snapshots
 MEMORY_SNAPSHOT_MAX_ENTRIES = 100000
+
+
+# TODO: introduce an owner class, namely Profiler
+@dataclass(kw_only=True, slots=True)
+class ProfilingConfig:
+    enable_profiling: bool = False
+    """Whether to enable pytorch profile"""
+
+    save_traces_folder: str = "profile_traces"
+    """Trace files location"""
+
+    profile_freq: int = 10
+    """How often to collect profile traces, in iterations"""
+
+    profiler_active: int = 1
+    """
+    The steps profiler is active for.
+
+    This is used to configure torch.profile.schedule.
+    """
+
+    profiler_warmup: int = 3
+    """
+    The number of warmup steps before the active step in each profiling cycle.
+
+    This is used to configure torch.profile.schedule.
+    """
+
+    profiler_repeat: int | None = None
+    """
+    The number of times to repeat the profiling cycle
+
+    This is used to configure torch.profile.schedule.
+    """
+
+    profiler_skip_first: int | None = None
+    """
+    The number of initial profiling cycles to skip
+
+    This is used to configure torch.profile.schedule.
+    """
+
+    profiler_skip_first_wait: int | None = None
+    """
+    The number of initial profiling cycles to skip the wait time
+
+    This is used to configure torch.profile.schedule.
+    """
+
+    enable_memory_snapshot: bool = False
+    """Whether to dump memory snapshot"""
+
+    save_memory_snapshot_folder: str = "memory_snapshot"
+    """Memory snapshot files location"""
 
 
 @contextlib.contextmanager
@@ -37,6 +90,16 @@ def maybe_enable_profiling(
             profiling_config.profiler_warmup,
             profiling_config.profiler_active,
         )
+
+        additional_params = {
+            key: val
+            for key, val in [
+                ("repeat", profiling_config.profiler_repeat),
+                ("skip_first", profiling_config.profiler_skip_first),
+                ("skip_first_wait", profiling_config.profiler_skip_first_wait),
+            ]
+            if val is not None
+        }
 
         rank = torch.distributed.get_rank()
 
@@ -75,7 +138,9 @@ def maybe_enable_profiling(
                 torch.profiler.ProfilerActivity.CPU,
                 gpu_device_profiled,
             ],
-            schedule=torch.profiler.schedule(wait=wait, warmup=warmup, active=active),
+            schedule=torch.profiler.schedule(
+                wait=wait, warmup=warmup, active=active, **additional_params
+            ),
             on_trace_ready=trace_handler,
             record_shapes=True,
         ) as torch_profiler:
@@ -141,7 +206,8 @@ def maybe_enable_memory_snapshot(
         profiler = MemoryProfiler(global_step, profiling_config.profile_freq)
         try:
             yield profiler
-        except torch.OutOfMemoryError as e:
+        except torch.OutOfMemoryError:
             profiler.step(exit_ctx=True)
+            raise
     else:
         yield None

@@ -5,29 +5,32 @@
 # LICENSE file in the root directory of this source tree.
 
 from torchtitan.components.loss import build_mse_loss
-from torchtitan.components.lr_scheduler import build_lr_schedulers
-from torchtitan.components.optimizer import build_optimizers
+from torchtitan.models.common.linear import Linear
+from torchtitan.protocols.model_spec import ModelSpec
 
-from torchtitan.models.flux.flux_datasets import build_flux_dataloader
-from torchtitan.protocols.train_spec import TrainSpec
-from .infra.parallelize import parallelize_flux
-from .model.args import FluxModelArgs
+from .flux_datasets import FluxDataLoader
 from .model.autoencoder import AutoEncoderParams
+from .model.layers import (
+    DoubleStreamBlock,
+    EmbedND,
+    LastLayer,
+    MLPEmbedder,
+    SingleStreamBlock,
+)
 from .model.model import FluxModel
 from .model.state_dict_adapter import FluxStateDictAdapter
-from .validate import build_flux_validator
+from .parallelize import parallelize_flux
 
 __all__ = [
-    "FluxModelArgs",
     "FluxModel",
-    # pyrefly: ignore [missing-module-attribute]
+    "FluxDataLoader",
     "flux_configs",
     "parallelize_flux",
 ]
 
 
-flux_args = {
-    "flux-dev": FluxModelArgs(
+flux_configs = {
+    "flux-dev": FluxModel.Config(
         in_channels=64,
         out_channels=64,
         vec_in_dim=768,
@@ -40,6 +43,8 @@ flux_args = {
         axes_dim=(16, 56, 56),
         theta=10_000,
         qkv_bias=True,
+        img_in=Linear.Config(bias=True),
+        txt_in=Linear.Config(bias=True),
         autoencoder_params=AutoEncoderParams(
             resolution=256,
             in_channels=3,
@@ -51,8 +56,45 @@ flux_args = {
             scale_factor=0.3611,
             shift_factor=0.1159,
         ),
+        pe_config=EmbedND.Config(dim=128, theta=10_000, axes_dim=(16, 56, 56)),
+        time_in_config=MLPEmbedder.Config(
+            in_dim=256,
+            hidden_dim=3072,
+            in_layer=Linear.Config(bias=True),
+            out_layer=Linear.Config(bias=True),
+        ),
+        vector_in_config=MLPEmbedder.Config(
+            in_dim=768,
+            hidden_dim=3072,
+            in_layer=Linear.Config(bias=True),
+            out_layer=Linear.Config(bias=True),
+        ),
+        double_block_config=DoubleStreamBlock.Config(
+            hidden_size=3072,
+            num_heads=24,
+            mlp_ratio=4.0,
+            qkv_bias=True,
+            img_mlp_in=Linear.Config(bias=True),
+            img_mlp_out=Linear.Config(bias=True),
+            txt_mlp_in=Linear.Config(bias=True),
+            txt_mlp_out=Linear.Config(bias=True),
+        ),
+        single_block_config=SingleStreamBlock.Config(
+            hidden_size=3072,
+            num_heads=24,
+            mlp_ratio=4.0,
+            linear1=Linear.Config(bias=True),
+            linear2=Linear.Config(bias=True),
+        ),
+        final_layer_config=LastLayer.Config(
+            hidden_size=3072,
+            patch_size=1,
+            out_channels=64,
+            linear=Linear.Config(bias=True),
+            adaln_linear=Linear.Config(bias=True),
+        ),
     ),
-    "flux-schnell": FluxModelArgs(
+    "flux-schnell": FluxModel.Config(
         in_channels=64,
         out_channels=64,
         vec_in_dim=768,
@@ -65,6 +107,8 @@ flux_args = {
         axes_dim=(16, 56, 56),
         theta=10_000,
         qkv_bias=True,
+        img_in=Linear.Config(bias=True),
+        txt_in=Linear.Config(bias=True),
         autoencoder_params=AutoEncoderParams(
             resolution=256,
             in_channels=3,
@@ -76,8 +120,45 @@ flux_args = {
             scale_factor=0.3611,
             shift_factor=0.1159,
         ),
+        pe_config=EmbedND.Config(dim=128, theta=10_000, axes_dim=(16, 56, 56)),
+        time_in_config=MLPEmbedder.Config(
+            in_dim=256,
+            hidden_dim=3072,
+            in_layer=Linear.Config(bias=True),
+            out_layer=Linear.Config(bias=True),
+        ),
+        vector_in_config=MLPEmbedder.Config(
+            in_dim=768,
+            hidden_dim=3072,
+            in_layer=Linear.Config(bias=True),
+            out_layer=Linear.Config(bias=True),
+        ),
+        double_block_config=DoubleStreamBlock.Config(
+            hidden_size=3072,
+            num_heads=24,
+            mlp_ratio=4.0,
+            qkv_bias=True,
+            img_mlp_in=Linear.Config(bias=True),
+            img_mlp_out=Linear.Config(bias=True),
+            txt_mlp_in=Linear.Config(bias=True),
+            txt_mlp_out=Linear.Config(bias=True),
+        ),
+        single_block_config=SingleStreamBlock.Config(
+            hidden_size=3072,
+            num_heads=24,
+            mlp_ratio=4.0,
+            linear1=Linear.Config(bias=True),
+            linear2=Linear.Config(bias=True),
+        ),
+        final_layer_config=LastLayer.Config(
+            hidden_size=3072,
+            patch_size=1,
+            out_channels=64,
+            linear=Linear.Config(bias=True),
+            adaln_linear=Linear.Config(bias=True),
+        ),
     ),
-    "flux-debug": FluxModelArgs(
+    "flux-debug": FluxModel.Config(
         in_channels=64,
         out_channels=64,
         vec_in_dim=768,
@@ -90,6 +171,8 @@ flux_args = {
         axes_dim=(16, 56, 56),
         theta=10_000,
         qkv_bias=True,
+        img_in=Linear.Config(bias=True),
+        txt_in=Linear.Config(bias=True),
         autoencoder_params=AutoEncoderParams(
             resolution=256,
             in_channels=3,
@@ -101,21 +184,55 @@ flux_args = {
             scale_factor=0.3611,
             shift_factor=0.1159,
         ),
+        pe_config=EmbedND.Config(dim=128, theta=10_000, axes_dim=(16, 56, 56)),
+        time_in_config=MLPEmbedder.Config(
+            in_dim=256,
+            hidden_dim=1536,
+            in_layer=Linear.Config(bias=True),
+            out_layer=Linear.Config(bias=True),
+        ),
+        vector_in_config=MLPEmbedder.Config(
+            in_dim=768,
+            hidden_dim=1536,
+            in_layer=Linear.Config(bias=True),
+            out_layer=Linear.Config(bias=True),
+        ),
+        double_block_config=DoubleStreamBlock.Config(
+            hidden_size=1536,
+            num_heads=12,
+            mlp_ratio=4.0,
+            qkv_bias=True,
+            img_mlp_in=Linear.Config(bias=True),
+            img_mlp_out=Linear.Config(bias=True),
+            txt_mlp_in=Linear.Config(bias=True),
+            txt_mlp_out=Linear.Config(bias=True),
+        ),
+        single_block_config=SingleStreamBlock.Config(
+            hidden_size=1536,
+            num_heads=12,
+            mlp_ratio=4.0,
+            linear1=Linear.Config(bias=True),
+            linear2=Linear.Config(bias=True),
+        ),
+        final_layer_config=LastLayer.Config(
+            hidden_size=1536,
+            patch_size=1,
+            out_channels=64,
+            linear=Linear.Config(bias=True),
+            adaln_linear=Linear.Config(bias=True),
+        ),
     ),
 }
 
 
-def get_train_spec() -> TrainSpec:
-    return TrainSpec(
-        model_cls=FluxModel,
-        model_args=flux_args,
+def model_registry(flavor: str) -> ModelSpec:
+    return ModelSpec(
+        name="flux",
+        flavor=flavor,
+        model=flux_configs[flavor],
         parallelize_fn=parallelize_flux,
         pipelining_fn=None,
-        build_optimizers_fn=build_optimizers,
-        build_lr_schedulers_fn=build_lr_schedulers,
-        build_dataloader_fn=build_flux_dataloader,
-        build_tokenizer_fn=None,
         build_loss_fn=build_mse_loss,
-        build_validator_fn=build_flux_validator,
+        post_optimizer_build_fn=None,
         state_dict_adapter=FluxStateDictAdapter,
     )

@@ -6,256 +6,419 @@
 #
 # Copyright (c) Meta Platforms, Inc. All Rights Reserved.
 
-from torchtitan.components.loss import build_cross_entropy_loss
-from torchtitan.components.lr_scheduler import build_lr_schedulers
-from torchtitan.components.optimizer import build_optimizers
-from torchtitan.components.tokenizer import build_hf_tokenizer
-from torchtitan.components.validate import build_validator
-from torchtitan.hf_datasets.text_datasets import build_text_dataloader
-from torchtitan.models.moe import MoEArgs
-from torchtitan.protocols.train_spec import TrainSpec
+import copy
 
-from .infra.parallelize import parallelize_qwen3
-from .model.args import Qwen3ModelArgs
-from .model.model import Qwen3Model
-from .model.state_dict_adapter import Qwen3StateDictAdapter
+from torchtitan.components.loss import build_cross_entropy_loss
+from torchtitan.distributed.pipeline_parallel import pipeline_llm
+from torchtitan.models.common import Embedding, FeedForward, GQAttention, Linear, RoPE
+from torchtitan.models.common.moe import MoE, TokenChoiceTopKRouter
+from torchtitan.models.common.rmsnorm import RMSNorm
+from torchtitan.protocols.model_spec import ModelSpec
+
+from .model import Qwen3Model, Qwen3TransformerBlock
+from .parallelize import parallelize_qwen3
+from .state_dict_adapter import Qwen3StateDictAdapter
 
 __all__ = [
     "parallelize_qwen3",
-    "Qwen3ModelArgs",
     "Qwen3Model",
-    "qwen3_args",
+    "qwen3_configs",
 ]
 
 # Adding different variants of the model
 
-qwen3_args = {
-    "debugmodel": Qwen3ModelArgs(
+qwen3_configs = {
+    "debugmodel": Qwen3Model.Config(
         vocab_size=2048,
-        max_seq_len=4096,
-        head_dim=128,
         dim=256,
         n_layers=8,
-        n_heads=16,
-        n_kv_heads=8,
-        qk_norm=True,
-        hidden_dim=3072,
-        rope_theta=1000000,
+        norm=RMSNorm.Config(eps=1e-6),
         enable_weight_tying=True,
+        tok_embeddings=Embedding.Config(),
+        output=Linear.Config(),
+        layer=Qwen3TransformerBlock.Config(
+            attention_norm=RMSNorm.Config(eps=1e-6),
+            ffn_norm=RMSNorm.Config(eps=1e-6),
+            feed_forward=FeedForward.Config(
+                hidden_dim=3072,
+            ),
+            attention=GQAttention.Config(
+                n_heads=16,
+                n_kv_heads=8,
+                head_dim=128,
+                q_norm=RMSNorm.Config(eps=1e-6),
+                k_norm=RMSNorm.Config(eps=1e-6),
+                attn_backend="sdpa",
+                rope_backend="cos_sin",
+            ),
+        ),
+        rope=RoPE.Config(
+            dim=128,
+            max_seq_len=4096,
+            theta=1000000.0,
+            backend="cos_sin",
+        ),
     ),
-    # Debug model for weight sharing experiments (smaller dims for fast iteration)
-    "debugmodel_weightshared": Qwen3ModelArgs(
+    "debugmodel_flex": Qwen3Model.Config(
         vocab_size=2048,
-        max_seq_len=1024,
-        head_dim=64,
         dim=256,
         n_layers=8,
-        n_heads=8,
-        n_kv_heads=4,
-        qk_norm=True,
-        hidden_dim=512,
-        rope_theta=1000000,
-        enable_weight_tying=False,  # Using factorized embedding tie_output instead
+        norm=RMSNorm.Config(eps=1e-6),
+        enable_weight_tying=True,
+        tok_embeddings=Embedding.Config(),
+        output=Linear.Config(),
+        layer=Qwen3TransformerBlock.Config(
+            attention_norm=RMSNorm.Config(eps=1e-6),
+            ffn_norm=RMSNorm.Config(eps=1e-6),
+            feed_forward=FeedForward.Config(hidden_dim=3072),
+            attention=GQAttention.Config(
+                n_heads=16,
+                n_kv_heads=8,
+                head_dim=128,
+                q_norm=RMSNorm.Config(eps=1e-6),
+                k_norm=RMSNorm.Config(eps=1e-6),
+                attn_backend="flex",
+                rope_backend="cos_sin",
+            ),
+        ),
+        rope=RoPE.Config(
+            dim=128,
+            max_seq_len=4096,
+            theta=1000000.0,
+            backend="cos_sin",
+        ),
     ),
-    # Weight sharing experiment models (ported from old torchtitan llama3 configs)
-    "40M": Qwen3ModelArgs(
+    "0.6B": Qwen3Model.Config(
         vocab_size=151936,
-        max_seq_len=8192,
-        head_dim=32,  # 512 / 16 = 32
-        dim=512,
-        n_layers=12,
-        n_heads=16,
-        n_kv_heads=8,
-        qk_norm=True,
-        hidden_dim=2048,  # ~4 * dim * 2/3 * 1.5 rounded
-        rope_theta=500000,
-        enable_weight_tying=False,
-    ),
-    "250M_shared": Qwen3ModelArgs(
-        vocab_size=151936,
-        max_seq_len=2048,
-        head_dim=64,  # 1024 / 16 = 64
-        dim=1024,
-        n_layers=20,  # Note: layer sharing will expand this virtually
-        n_heads=16,
-        n_kv_heads=8,
-        qk_norm=True,
-        hidden_dim=3072,  # ~4 * dim * 2/3 * 1.125 rounded
-        rope_theta=500000,
-        enable_weight_tying=False,  # Using factorized embedding instead
-    ),
-    "250M_unshared": Qwen3ModelArgs(
-        vocab_size=151936,
-        max_seq_len=2048,
-        head_dim=48,  # 768 / 16 = 48
-        dim=768,
-        n_layers=20,
-        n_heads=16,
-        n_kv_heads=8,
-        qk_norm=True,
-        hidden_dim=3072,  # ~4 * dim * 2/3 * 1.5 rounded
-        rope_theta=500000,
-        enable_weight_tying=True,  # Standard weight tying
-    ),
-    "0.6B": Qwen3ModelArgs(
-        vocab_size=151936,
-        max_seq_len=4096,
-        head_dim=128,
         dim=1024,
         n_layers=28,
-        n_heads=16,
-        n_kv_heads=8,
-        qk_norm=True,
-        hidden_dim=3072,
-        rope_theta=1000000,
+        norm=RMSNorm.Config(eps=1e-6),
         enable_weight_tying=True,
+        tok_embeddings=Embedding.Config(),
+        output=Linear.Config(),
+        layer=Qwen3TransformerBlock.Config(
+            attention_norm=RMSNorm.Config(eps=1e-6),
+            ffn_norm=RMSNorm.Config(eps=1e-6),
+            feed_forward=FeedForward.Config(
+                hidden_dim=3072,
+            ),
+            attention=GQAttention.Config(
+                n_heads=16,
+                n_kv_heads=8,
+                head_dim=128,
+                q_norm=RMSNorm.Config(eps=1e-6),
+                k_norm=RMSNorm.Config(eps=1e-6),
+                attn_backend="sdpa",
+                rope_backend="cos_sin",
+            ),
+        ),
+        rope=RoPE.Config(
+            dim=128,
+            max_seq_len=4096,
+            theta=1000000.0,
+            backend="cos_sin",
+        ),
     ),
-    "1.7B": Qwen3ModelArgs(
+    "1.7B": Qwen3Model.Config(
         vocab_size=151936,
-        max_seq_len=4096,
-        head_dim=128,
         dim=2048,
         n_layers=28,
-        n_heads=16,
-        n_kv_heads=8,
-        qk_norm=True,
-        hidden_dim=6144,
-        rope_theta=1000000,
+        norm=RMSNorm.Config(eps=1e-6),
         enable_weight_tying=True,
+        tok_embeddings=Embedding.Config(),
+        output=Linear.Config(),
+        layer=Qwen3TransformerBlock.Config(
+            attention_norm=RMSNorm.Config(eps=1e-6),
+            ffn_norm=RMSNorm.Config(eps=1e-6),
+            feed_forward=FeedForward.Config(
+                hidden_dim=6144,
+            ),
+            attention=GQAttention.Config(
+                n_heads=16,
+                n_kv_heads=8,
+                head_dim=128,
+                q_norm=RMSNorm.Config(eps=1e-6),
+                k_norm=RMSNorm.Config(eps=1e-6),
+                attn_backend="sdpa",
+                rope_backend="cos_sin",
+            ),
+        ),
+        rope=RoPE.Config(
+            dim=128,
+            max_seq_len=4096,
+            theta=1000000.0,
+            backend="cos_sin",
+        ),
     ),
-    "4B": Qwen3ModelArgs(
+    "4B": Qwen3Model.Config(
         vocab_size=151936,
-        max_seq_len=4096,
-        head_dim=128,
         dim=2560,
         n_layers=36,
-        n_heads=32,
-        n_kv_heads=8,
-        qk_norm=True,
-        hidden_dim=9728,
-        rope_theta=1000000,
+        norm=RMSNorm.Config(eps=1e-6),
         enable_weight_tying=True,
+        tok_embeddings=Embedding.Config(),
+        output=Linear.Config(),
+        layer=Qwen3TransformerBlock.Config(
+            attention_norm=RMSNorm.Config(eps=1e-6),
+            ffn_norm=RMSNorm.Config(eps=1e-6),
+            feed_forward=FeedForward.Config(
+                hidden_dim=9728,
+            ),
+            attention=GQAttention.Config(
+                n_heads=32,
+                n_kv_heads=8,
+                head_dim=128,
+                q_norm=RMSNorm.Config(eps=1e-6),
+                k_norm=RMSNorm.Config(eps=1e-6),
+                attn_backend="sdpa",
+                rope_backend="cos_sin",
+            ),
+        ),
+        rope=RoPE.Config(
+            dim=128,
+            max_seq_len=4096,
+            theta=1000000.0,
+            backend="cos_sin",
+        ),
     ),
-    "8B": Qwen3ModelArgs(
+    "8B": Qwen3Model.Config(
         vocab_size=151936,
-        max_seq_len=4096,
-        head_dim=128,
         dim=4096,
         n_layers=36,
-        n_heads=32,
-        n_kv_heads=8,
-        qk_norm=True,
-        hidden_dim=12288,
-        rope_theta=1000000,
+        tok_embeddings=Embedding.Config(),
+        output=Linear.Config(),
+        norm=RMSNorm.Config(eps=1e-6),
+        layer=Qwen3TransformerBlock.Config(
+            attention_norm=RMSNorm.Config(eps=1e-6),
+            ffn_norm=RMSNorm.Config(eps=1e-6),
+            feed_forward=FeedForward.Config(
+                hidden_dim=12288,
+            ),
+            attention=GQAttention.Config(
+                n_heads=32,
+                n_kv_heads=8,
+                head_dim=128,
+                q_norm=RMSNorm.Config(eps=1e-6),
+                k_norm=RMSNorm.Config(eps=1e-6),
+                attn_backend="sdpa",
+                rope_backend="cos_sin",
+            ),
+        ),
+        rope=RoPE.Config(
+            dim=128,
+            max_seq_len=4096,
+            theta=1000000.0,
+            backend="cos_sin",
+        ),
     ),
-    "14B": Qwen3ModelArgs(
+    "14B": Qwen3Model.Config(
         vocab_size=151936,
-        max_seq_len=4096,
-        head_dim=128,
         dim=5120,
         n_layers=40,
-        n_heads=40,
-        n_kv_heads=8,
-        qk_norm=True,
-        hidden_dim=17408,
-        rope_theta=1000000,
+        tok_embeddings=Embedding.Config(),
+        output=Linear.Config(),
+        norm=RMSNorm.Config(eps=1e-6),
+        layer=Qwen3TransformerBlock.Config(
+            attention_norm=RMSNorm.Config(eps=1e-6),
+            ffn_norm=RMSNorm.Config(eps=1e-6),
+            feed_forward=FeedForward.Config(
+                hidden_dim=17408,
+            ),
+            attention=GQAttention.Config(
+                n_heads=40,
+                n_kv_heads=8,
+                head_dim=128,
+                q_norm=RMSNorm.Config(eps=1e-6),
+                k_norm=RMSNorm.Config(eps=1e-6),
+                attn_backend="sdpa",
+                rope_backend="cos_sin",
+            ),
+        ),
+        rope=RoPE.Config(
+            dim=128,
+            max_seq_len=4096,
+            theta=1000000.0,
+            backend="cos_sin",
+        ),
     ),
-    "32B": Qwen3ModelArgs(
+    "32B": Qwen3Model.Config(
         vocab_size=151936,
-        max_seq_len=4096,
-        head_dim=128,
         dim=5120,
         n_layers=64,
-        n_heads=64,
-        n_kv_heads=8,
-        qk_norm=True,
-        hidden_dim=25600,
-        rope_theta=1000000,
+        tok_embeddings=Embedding.Config(),
+        output=Linear.Config(),
+        norm=RMSNorm.Config(eps=1e-6),
+        layer=Qwen3TransformerBlock.Config(
+            attention_norm=RMSNorm.Config(eps=1e-6),
+            ffn_norm=RMSNorm.Config(eps=1e-6),
+            feed_forward=FeedForward.Config(
+                hidden_dim=25600,
+            ),
+            attention=GQAttention.Config(
+                n_heads=64,
+                n_kv_heads=8,
+                head_dim=128,
+                q_norm=RMSNorm.Config(eps=1e-6),
+                k_norm=RMSNorm.Config(eps=1e-6),
+                attn_backend="sdpa",
+                rope_backend="cos_sin",
+            ),
+        ),
+        rope=RoPE.Config(
+            dim=128,
+            max_seq_len=4096,
+            theta=1000000.0,
+            backend="cos_sin",
+        ),
     ),
     # Qwen3-MoE models
-    "debugmodel_moe": Qwen3ModelArgs(
+    "debugmodel_moe": Qwen3Model.Config(
         vocab_size=2048,
-        max_seq_len=4096,
-        head_dim=128,
         dim=256,
         n_layers=8,
-        n_heads=16,
-        n_kv_heads=8,
-        qk_norm=True,
-        hidden_dim=3072,
-        rope_theta=1000000,
-        moe_enabled=True,
-        moe_inter_dim=768,
-        moe_args=MoEArgs(
-            num_experts=64,
-            num_shared_experts=0,
-            top_k=8,
-            score_func="softmax",
-            route_norm=True,
-            route_scale=1.0,
-            score_before_experts=False,
+        tok_embeddings=Embedding.Config(),
+        output=Linear.Config(),
+        norm=RMSNorm.Config(eps=1e-6),
+        layer=Qwen3TransformerBlock.Config(
+            attention_norm=RMSNorm.Config(eps=1e-6),
+            ffn_norm=RMSNorm.Config(eps=1e-6),
+            moe_enabled=True,
+            moe=MoE.Config(
+                hidden_dim=768,
+                num_experts=64,
+                num_shared_experts=0,
+                score_before_experts=False,
+                router=TokenChoiceTopKRouter.Config(
+                    top_k=8,
+                    score_func="softmax",
+                    route_norm=True,
+                ),
+            ),
+            feed_forward=FeedForward.Config(
+                hidden_dim=3072,
+            ),
+            attention=GQAttention.Config(
+                n_heads=16,
+                n_kv_heads=8,
+                head_dim=128,
+                q_norm=RMSNorm.Config(eps=1e-6),
+                k_norm=RMSNorm.Config(eps=1e-6),
+                attn_backend="sdpa",
+                rope_backend="cos_sin",
+            ),
+        ),
+        rope=RoPE.Config(
+            dim=128,
+            max_seq_len=4096,
+            theta=1000000.0,
+            backend="cos_sin",
         ),
     ),
-    "30B-A3B": Qwen3ModelArgs(
+    "30B-A3B": Qwen3Model.Config(
         vocab_size=151936,
-        max_seq_len=262144,
-        head_dim=128,
         dim=2048,
         n_layers=48,
-        n_heads=32,
-        n_kv_heads=4,
-        qk_norm=True,
-        hidden_dim=6144,
-        rope_theta=1000000,
-        moe_enabled=True,
-        moe_inter_dim=768,
-        moe_args=MoEArgs(
-            num_experts=128,
-            num_shared_experts=0,
-            top_k=8,
-            score_func="softmax",
-            route_norm=True,
-            route_scale=1.0,
-            score_before_experts=False,
+        tok_embeddings=Embedding.Config(),
+        output=Linear.Config(),
+        norm=RMSNorm.Config(eps=1e-6),
+        layer=Qwen3TransformerBlock.Config(
+            attention_norm=RMSNorm.Config(eps=1e-6),
+            ffn_norm=RMSNorm.Config(eps=1e-6),
+            moe_enabled=True,
+            moe=MoE.Config(
+                hidden_dim=768,
+                num_experts=128,
+                num_shared_experts=0,
+                score_before_experts=False,
+                router=TokenChoiceTopKRouter.Config(
+                    top_k=8,
+                    score_func="softmax",
+                    route_norm=True,
+                ),
+            ),
+            feed_forward=FeedForward.Config(
+                hidden_dim=6144,
+            ),
+            attention=GQAttention.Config(
+                n_heads=32,
+                n_kv_heads=4,
+                head_dim=128,
+                q_norm=RMSNorm.Config(eps=1e-6),
+                k_norm=RMSNorm.Config(eps=1e-6),
+                attn_backend="sdpa",
+                rope_backend="cos_sin",
+            ),
+        ),
+        rope=RoPE.Config(
+            dim=128,
+            max_seq_len=262144,
+            theta=1000000.0,
+            backend="cos_sin",
         ),
     ),
-    "235B-A22B": Qwen3ModelArgs(
+    "235B-A22B": Qwen3Model.Config(
         vocab_size=151936,
-        max_seq_len=4096,
-        head_dim=128,
         dim=4096,
         n_layers=94,
-        n_heads=64,
-        n_kv_heads=4,
-        qk_norm=True,
-        hidden_dim=12288,
-        rope_theta=5000000,
-        moe_enabled=True,
-        moe_inter_dim=1536,
-        moe_args=MoEArgs(
-            num_experts=128,
-            num_shared_experts=0,  # no shared experts, double check
-            top_k=8,  # num_experts_per_tok
-            score_func="softmax",  # need double check
-            route_norm=True,
-            route_scale=1.0,  # not needed, need double check
-            score_before_experts=False,
+        tok_embeddings=Embedding.Config(),
+        output=Linear.Config(),
+        norm=RMSNorm.Config(eps=1e-6),
+        layer=Qwen3TransformerBlock.Config(
+            attention_norm=RMSNorm.Config(eps=1e-6),
+            ffn_norm=RMSNorm.Config(eps=1e-6),
+            moe_enabled=True,
+            moe=MoE.Config(
+                hidden_dim=1536,
+                num_experts=128,
+                num_shared_experts=0,
+                score_before_experts=False,
+                router=TokenChoiceTopKRouter.Config(
+                    top_k=8,
+                    score_func="softmax",
+                    route_norm=True,
+                ),
+            ),
+            feed_forward=FeedForward.Config(
+                hidden_dim=12288,
+            ),
+            attention=GQAttention.Config(
+                n_heads=64,
+                n_kv_heads=4,
+                head_dim=128,
+                q_norm=RMSNorm.Config(eps=1e-6),
+                k_norm=RMSNorm.Config(eps=1e-6),
+                attn_backend="sdpa",
+                rope_backend="cos_sin",
+            ),
+        ),
+        rope=RoPE.Config(
+            dim=128,
+            max_seq_len=4096,
+            theta=5000000.0,
+            backend="cos_sin",
         ),
     ),
 }
 
 
-def get_train_spec() -> TrainSpec:
-    return TrainSpec(
-        model_cls=Qwen3Model,
-        model_args=qwen3_args,  # Change from dict to Mapping
+def model_registry(flavor: str, attn_backend_override: str | None = None) -> ModelSpec:
+    model = copy.deepcopy(qwen3_configs[flavor])
+    if attn_backend_override is not None:
+        assert attn_backend_override in [
+            "sdpa",
+            "flex",
+            "varlen",
+        ], f"Invalid attn_backend_override: {attn_backend_override}"
+        model.layer.attention.attn_backend = attn_backend_override
+        if attn_backend_override == "varlen":
+            model.layer.attention.attn_mask_type = "block_causal"
+    return ModelSpec(
+        name="qwen3",
+        flavor=flavor,
+        model=model,
         parallelize_fn=parallelize_qwen3,
-        pipelining_fn=None,
-        build_optimizers_fn=build_optimizers,
-        build_lr_schedulers_fn=build_lr_schedulers,
-        build_dataloader_fn=build_text_dataloader,
-        build_tokenizer_fn=build_hf_tokenizer,
+        pipelining_fn=pipeline_llm,
         build_loss_fn=build_cross_entropy_loss,
-        build_validator_fn=build_validator,
+        post_optimizer_build_fn=None,
         state_dict_adapter=Qwen3StateDictAdapter,
     )
