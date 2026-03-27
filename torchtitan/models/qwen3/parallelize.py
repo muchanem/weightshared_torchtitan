@@ -59,6 +59,13 @@ def parallelize_qwen3(
         ({parallel_dims.tp}) and 2 * CP degree ({parallel_dims.cp}).
         """
 
+    # Weight sharing is incompatible with pipeline parallelism
+    ws_active = (
+        model.config.layer_sharing.enabled or model.config.attention_sharing.enabled
+    )
+    if ws_active and parallel_dims.pp_enabled:
+        raise ValueError("Weight sharing is not supported with Pipeline Parallel.")
+
     model_compile_enabled = (
         compile_config.enable and "model" in compile_config.components
     )
@@ -104,12 +111,18 @@ def parallelize_qwen3(
 
     if parallel_dims.cp_enabled:
         attn_backend = getattr(model.config.layer.attention, "attn_backend", "sdpa")
-        apply_cp_to_attention_module(
-            # pyrefly: ignore [missing-attribute, not-callable]
-            [block.attention.inner_attention for block in model.layers.values()],
-            parallel_dims.get_mesh("cp"),
-            attn_backend,
-        )
+        # Only standard blocks have .attention.inner_attention
+        inner_attns = [
+            block.attention.inner_attention
+            for block in model.layers.values()
+            if hasattr(block, "attention") and hasattr(block.attention, "inner_attention")
+        ]
+        if inner_attns:
+            apply_cp_to_attention_module(
+                inner_attns,
+                parallel_dims.get_mesh("cp"),
+                attn_backend,
+            )
 
     if ac_config.mode != "none":
         apply_ac(
