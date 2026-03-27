@@ -21,8 +21,10 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from torchtitan.protocols.module import Module
 
-class BatchedLoRAModule(nn.Module):
+
+class BatchedLoRAModule(Module):
     """LoRA module with weights pre-stacked for batched matmul.
 
     Stores weights as (n_loras, rank, in_dim) and (n_loras, out_dim, rank) tensors
@@ -97,7 +99,7 @@ class BatchedLoRAModule(nn.Module):
         return self.w_a[idx], self.w_b[idx]
 
 
-class BatchedFFNLoRA(nn.Module):
+class BatchedFFNLoRA(Module):
     """FFN with batched LoRA for w1 and w3 (which share same input).
 
     w1 and w3 LoRA computations are batched together since they:

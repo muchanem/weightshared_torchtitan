@@ -29,15 +29,15 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.nn.attention.flex_attention import BlockMask
 
-from torchtitan.models.attention import (
+from torchtitan.models.common import (
     FlexAttentionWrapper,
     ScaledDotProductAttentionWrapper,
     VarlenAttentionWrapper,
     VarlenMetadata,
+    RMSNorm,
 )
-from torchtitan.protocols.model import AttentionMasksType
-
-from .args import Qwen3ModelArgs
+from torchtitan.models.common.attention import AttentionMasksType
+from torchtitan.protocols.module import Module
 from .batched_lora import BatchedLoRAModule
 
 
@@ -96,7 +96,7 @@ def broadcast_add(
     return base + delta
 
 
-class TiedLinear(nn.Module):
+class TiedLinear(Module):
     """Linear layer that shares weights with another linear module.
 
     This wrapper enables weight sharing between linear layers without duplicating
@@ -118,7 +118,7 @@ class TiedLinear(nn.Module):
         return F.linear(x, self.source.weight)
 
 
-class ScaledLoRAModule(nn.Module):
+class ScaledLoRAModule(Module):
     """Low-rank adaptation module.
 
     Implements LoRA: output = x @ A @ B
@@ -175,7 +175,7 @@ class ScaledLoRAModule(nn.Module):
         return self.w_b(self.w_a(x))
 
 
-class SharedLinearWithLoRA(nn.Module):
+class SharedLinearWithLoRA(Module):
     """Linear layer with shared base weights and per-instance LoRA adapter.
 
     This module enables weight sharing across layers while allowing each layer
@@ -239,7 +239,7 @@ def _qkv_str_to_attr(s: str) -> str:
     return mapping[s]
 
 
-class SharedAttention(nn.Module):
+class SharedAttention(Module):
     """Attention module with shared weights and per-head LoRA offsets.
 
     Supports various sharing modes:
@@ -248,7 +248,13 @@ class SharedAttention(nn.Module):
     - LoRA offsets: Per-head learned offsets via low-rank adapters
 
     Args:
-        model_args: Model configuration arguments.
+        dim: Model dimension.
+        n_heads: Number of attention heads.
+        n_kv_heads: Number of key/value heads.
+        head_dim: Dimension per attention head.
+        qk_norm: Whether to apply QK normalization.
+        norm_eps: Epsilon for normalization layers.
+        attn_type: Attention implementation type ("sdpa", "flex", "varlen").
         qkv_sharing: Groups of tied projections, e.g., [["q","k","v"]].
         head_sharing: Whether to share weights across heads.
         grouping: Number of template heads per group.
@@ -259,7 +265,14 @@ class SharedAttention(nn.Module):
 
     def __init__(
         self,
-        model_args: Qwen3ModelArgs,
+        *,
+        dim: int,
+        n_heads: int,
+        n_kv_heads: int,
+        head_dim: int,
+        qk_norm: bool,
+        norm_eps: float,
+        attn_type: str = "sdpa",
         qkv_sharing: Optional[Tuple[Tuple[str, ...], ...]] = None,
         head_sharing: bool = False,
         grouping: int = 1,
@@ -268,17 +281,17 @@ class SharedAttention(nn.Module):
         use_grouped_mm: bool = False,
     ):
         super().__init__()
-        self.dim = model_args.dim
-        self.head_dim = model_args.head_dim
-        self.n_heads = model_args.n_heads
+        self.dim = dim
+        self.head_dim = head_dim
+        self.n_heads = n_heads
         self.n_kv_heads = (
-            model_args.n_heads
-            if model_args.n_kv_heads is None
-            else model_args.n_kv_heads
+            n_heads
+            if n_kv_heads is None
+            else n_kv_heads
         )
         self.n_rep = self.n_heads // self.n_kv_heads
         self.scaling = self.head_dim**-0.5
-        self.attn_type = getattr(model_args, "attn_type", "sdpa")
+        self.attn_type = attn_type
 
         self.qkv_sharing = qkv_sharing
         self.head_sharing = head_sharing
@@ -288,12 +301,12 @@ class SharedAttention(nn.Module):
         self.use_grouped_mm = use_grouped_mm and rank > 0
 
         # QK norms (Qwen3-specific)
-        if model_args.qk_norm:
-            self.q_norm = nn.RMSNorm(
-                self.head_dim, eps=model_args.norm_eps, elementwise_affine=True
+        if qk_norm:
+            self.q_norm = RMSNorm(
+                self.head_dim, eps=norm_eps, elementwise_affine=True
             )
-            self.k_norm = nn.RMSNorm(
-                self.head_dim, eps=model_args.norm_eps, elementwise_affine=True
+            self.k_norm = RMSNorm(
+                self.head_dim, eps=norm_eps, elementwise_affine=True
             )
         else:
             self.q_norm = None
@@ -516,7 +529,7 @@ class SharedAttention(nn.Module):
         return self.wo(output)
 
 
-class SharedFeedForward(nn.Module):
+class SharedFeedForward(Module):
     """FeedForward module with shared weights and per-layer LoRA.
 
     Args:
@@ -600,69 +613,82 @@ class SharedFeedForward(nn.Module):
             self.w3.reset_parameters()
 
 
-class SharedAttentionWithLoRA(nn.Module):
+class SharedAttentionWithLoRA(Module):
     """Attention with shared base weights and per-layer LoRA adapters.
 
     This is used for layer sharing where different layers share the same
     attention weights but have unique LoRA adapters.
 
     Args:
-        model_args: Model configuration.
+        dim: Model dimension.
+        n_heads: Number of attention heads.
+        n_kv_heads: Number of key/value heads.
+        head_dim: Dimension per attention head.
+        qk_norm: Whether to apply QK normalization.
+        norm_eps: Epsilon for normalization layers.
         shared_weights: Dict with "wq", "wk", "wv", "wo" shared linear layers.
         lora_rank: LoRA rank for per-layer adapters.
+        attn_type: Attention implementation type.
     """
 
     def __init__(
         self,
-        model_args: Qwen3ModelArgs,
+        *,
+        dim: int,
+        n_heads: int,
+        n_kv_heads: int,
+        head_dim: int,
+        qk_norm: bool,
+        norm_eps: float,
         shared_weights: dict,
         lora_rank: int,
+        attn_type: str = "sdpa",
     ):
         super().__init__()
-        self.n_heads = model_args.n_heads
+        self.n_heads = n_heads
         self.n_kv_heads = (
-            model_args.n_heads
-            if model_args.n_kv_heads is None
-            else model_args.n_kv_heads
+            n_heads
+            if n_kv_heads is None
+            else n_kv_heads
         )
         self.n_rep = self.n_heads // self.n_kv_heads
-        self.head_dim = model_args.head_dim
+        self.head_dim = head_dim
         self.scaling = self.head_dim**-0.5
-        self.attn_type = getattr(model_args, "attn_type", "sdpa")
+        self.attn_type = attn_type
 
         # Shared weights with per-layer LoRA
         self.wq = SharedLinearWithLoRA(
             shared_weights["wq"],
-            model_args.dim,
-            model_args.n_heads * model_args.head_dim,
+            dim,
+            n_heads * head_dim,
             lora_rank,
         )
         self.wk = SharedLinearWithLoRA(
             shared_weights["wk"],
-            model_args.dim,
-            self.n_kv_heads * model_args.head_dim,
+            dim,
+            self.n_kv_heads * head_dim,
             lora_rank,
         )
         self.wv = SharedLinearWithLoRA(
             shared_weights["wv"],
-            model_args.dim,
-            self.n_kv_heads * model_args.head_dim,
+            dim,
+            self.n_kv_heads * head_dim,
             lora_rank,
         )
         self.wo = SharedLinearWithLoRA(
             shared_weights["wo"],
-            model_args.n_heads * model_args.head_dim,
-            model_args.dim,
+            n_heads * head_dim,
+            dim,
             lora_rank,
         )
 
         # QK norms
-        if model_args.qk_norm:
-            self.q_norm = nn.RMSNorm(
-                self.head_dim, eps=model_args.norm_eps, elementwise_affine=True
+        if qk_norm:
+            self.q_norm = RMSNorm(
+                self.head_dim, eps=norm_eps, elementwise_affine=True
             )
-            self.k_norm = nn.RMSNorm(
-                self.head_dim, eps=model_args.norm_eps, elementwise_affine=True
+            self.k_norm = RMSNorm(
+                self.head_dim, eps=norm_eps, elementwise_affine=True
             )
         else:
             self.q_norm = None
@@ -753,12 +779,20 @@ class SharedAttentionWithLoRA(nn.Module):
         return self.wo(output)
 
 
-class SharedTransformerBlock(nn.Module):
+class SharedTransformerBlock(Module):
     """Transformer block with shared weights and per-layer LoRA adapters.
 
     Args:
         layer_id: Layer identifier for init scaling.
-        model_args: Model configuration.
+        dim: Model dimension.
+        n_heads: Number of attention heads.
+        n_kv_heads: Number of key/value heads.
+        head_dim: Dimension per attention head.
+        hidden_dim: FFN hidden dimension.
+        norm_eps: Epsilon for normalization layers.
+        qk_norm: Whether to apply QK normalization.
+        n_layers: Total number of layers.
+        depth_init: Whether to use depth-dependent initialization.
         shared_attention_weights: Dict with shared attention linear layers.
         shared_ffn_weights: Dict with shared FFN linear layers.
         lora_rank: LoRA rank for per-layer adapters.
@@ -769,31 +803,47 @@ class SharedTransformerBlock(nn.Module):
 
     def __init__(
         self,
+        *,
         layer_id: int,
-        model_args: Qwen3ModelArgs,
+        dim: int,
+        n_heads: int,
+        n_kv_heads: int,
+        head_dim: int,
+        hidden_dim: int,
+        norm_eps: float,
+        qk_norm: bool,
+        n_layers: int,
+        depth_init: bool = False,
         shared_attention_weights: dict,
         shared_ffn_weights: dict,
         lora_rank: int,
     ):
         super().__init__()
-        self.n_heads = model_args.n_heads
-        self.dim = model_args.dim
+        self.n_heads = n_heads
+        self.dim = dim
         self.moe_enabled = False  # MoE not supported with weight sharing
 
         self.attention = SharedAttentionWithLoRA(
-            model_args, shared_attention_weights, lora_rank
+            dim=dim,
+            n_heads=n_heads,
+            n_kv_heads=n_kv_heads,
+            head_dim=head_dim,
+            qk_norm=qk_norm,
+            norm_eps=norm_eps,
+            shared_weights=shared_attention_weights,
+            lora_rank=lora_rank,
         )
         self.feed_forward = SharedFeedForward(
-            shared_ffn_weights, model_args.dim, model_args.hidden_dim, lora_rank
+            shared_ffn_weights, dim, hidden_dim, lora_rank
         )
 
-        self.attention_norm = nn.RMSNorm(model_args.dim, eps=model_args.norm_eps)
-        self.ffn_norm = nn.RMSNorm(model_args.dim, eps=model_args.norm_eps)
+        self.attention_norm = RMSNorm(dim, eps=norm_eps)
+        self.ffn_norm = RMSNorm(dim, eps=norm_eps)
 
-        if model_args.depth_init:
+        if depth_init:
             self.weight_init_std = 0.02 / (2 * (layer_id + 1)) ** 0.5
         else:
-            self.weight_init_std = 0.02 / (2 * model_args.n_layers) ** 0.5
+            self.weight_init_std = 0.02 / (2 * n_layers) ** 0.5
 
     def forward(
         self,
@@ -822,7 +872,7 @@ class SharedTransformerBlock(nn.Module):
         self.feed_forward.init_weights(self.weight_init_std)
 
 
-class AttentionSharingTransformerBlock(nn.Module):
+class AttentionSharingTransformerBlock(Module):
     """Transformer block with attention head sharing (no layer sharing).
 
     This block uses SharedAttention for head-level weight sharing while keeping
@@ -831,7 +881,16 @@ class AttentionSharingTransformerBlock(nn.Module):
 
     Args:
         layer_id: Layer identifier for depth-dependent initialization.
-        model_args: Model configuration.
+        dim: Model dimension.
+        n_heads: Number of attention heads.
+        n_kv_heads: Number of key/value heads.
+        head_dim: Dimension per attention head.
+        hidden_dim: FFN hidden dimension.
+        norm_eps: Epsilon for normalization layers.
+        n_layers: Total number of layers.
+        qk_norm: Whether to apply QK normalization.
+        moe_enabled: Whether MoE is enabled.
+        depth_init: Whether to use depth-dependent initialization.
         attention_config: AttentionSharingConfig with head_sharing, grouping, rank, etc.
     """
 
@@ -840,18 +899,35 @@ class AttentionSharingTransformerBlock(nn.Module):
 
     def __init__(
         self,
+        *,
         layer_id: int,
-        model_args: Qwen3ModelArgs,
+        dim: int,
+        n_heads: int,
+        n_kv_heads: int,
+        head_dim: int,
+        hidden_dim: int,
+        norm_eps: float,
+        n_layers: int,
+        qk_norm: bool,
+        moe_enabled: bool = False,
+        moe_args=None,
+        moe_inter_dim: int = 0,
+        depth_init: bool = False,
         attention_config,
     ):
         super().__init__()
-        self.n_heads = model_args.n_heads
-        self.dim = model_args.dim
-        self.moe_enabled = model_args.moe_enabled
+        self.n_heads = n_heads
+        self.dim = dim
+        self.moe_enabled = moe_enabled
 
         # Use SharedAttention for head-level sharing
         self.attention = SharedAttention(
-            model_args,
+            dim=dim,
+            n_heads=n_heads,
+            n_kv_heads=n_kv_heads,
+            head_dim=head_dim,
+            qk_norm=qk_norm,
+            norm_eps=norm_eps,
             qkv_sharing=tuple(tuple(g) for g in attention_config.qkv_sharing)
             if attention_config.qkv_sharing
             else None,
@@ -866,22 +942,22 @@ class AttentionSharingTransformerBlock(nn.Module):
             from torchtitan.models.moe import MoE
 
             self.moe = MoE(
-                model_args.moe_args,
-                dim=model_args.dim,
-                hidden_dim=model_args.moe_inter_dim,
+                moe_args,
+                dim=dim,
+                hidden_dim=moe_inter_dim,
             )
         else:
             self.feed_forward = FeedForward(
-                dim=model_args.dim, hidden_dim=model_args.hidden_dim
+                dim=dim, hidden_dim=hidden_dim
             )
 
-        self.attention_norm = nn.RMSNorm(model_args.dim, eps=model_args.norm_eps)
-        self.ffn_norm = nn.RMSNorm(model_args.dim, eps=model_args.norm_eps)
+        self.attention_norm = RMSNorm(dim, eps=norm_eps)
+        self.ffn_norm = RMSNorm(dim, eps=norm_eps)
 
-        if model_args.depth_init:
+        if depth_init:
             self.weight_init_std = 0.02 / (2 * (layer_id + 1)) ** 0.5
         else:
-            self.weight_init_std = 0.02 / (2 * model_args.n_layers) ** 0.5
+            self.weight_init_std = 0.02 / (2 * n_layers) ** 0.5
 
     def forward(
         self,
@@ -917,13 +993,13 @@ class AttentionSharingTransformerBlock(nn.Module):
             self.feed_forward.init_weights(self.weight_init_std)
 
 
-class FeedForward(nn.Module):
+class FeedForward(Module):
     """Standard FeedForward module (copy for use in AttentionSharingTransformerBlock).
 
     This is a local copy to avoid circular imports with model.py.
     """
 
-    def __init__(self, dim: int, hidden_dim: int):
+    def __init__(self, *, dim: int, hidden_dim: int):
         super().__init__()
         self.w1 = nn.Linear(dim, hidden_dim, bias=False)
         self.w2 = nn.Linear(hidden_dim, dim, bias=False)
@@ -938,7 +1014,7 @@ class FeedForward(nn.Module):
             nn.init.trunc_normal_(linear.weight, mean=0.0, std=init_std)
 
 
-class CombinedSharingTransformerBlock(nn.Module):
+class CombinedSharingTransformerBlock(Module):
     """Transformer block with both attention sharing AND layer sharing.
 
     This block combines:
@@ -947,7 +1023,15 @@ class CombinedSharingTransformerBlock(nn.Module):
 
     Args:
         layer_id: Layer identifier.
-        model_args: Model configuration.
+        dim: Model dimension.
+        n_heads: Number of attention heads.
+        n_kv_heads: Number of key/value heads.
+        head_dim: Dimension per attention head.
+        hidden_dim: FFN hidden dimension.
+        norm_eps: Epsilon for normalization layers.
+        n_layers: Total number of layers.
+        qk_norm: Whether to apply QK normalization.
+        depth_init: Whether to use depth-dependent initialization.
         shared_attention_weights: Dict with shared "wq", "wk", "wv", "wo" linear layers.
         shared_ffn_weights: Dict with shared "w1", "w2", "w3" linear layers.
         layer_lora_rank: LoRA rank for per-layer adapters.
@@ -959,37 +1043,51 @@ class CombinedSharingTransformerBlock(nn.Module):
 
     def __init__(
         self,
+        *,
         layer_id: int,
-        model_args: Qwen3ModelArgs,
+        dim: int,
+        n_heads: int,
+        n_kv_heads: int,
+        head_dim: int,
+        hidden_dim: int,
+        norm_eps: float,
+        n_layers: int,
+        qk_norm: bool,
+        depth_init: bool = False,
         shared_attention_weights: dict,
         shared_ffn_weights: dict,
         layer_lora_rank: int,
         attention_config,
     ):
         super().__init__()
-        self.n_heads = model_args.n_heads
-        self.dim = model_args.dim
+        self.n_heads = n_heads
+        self.dim = dim
         self.moe_enabled = False  # MoE not supported with weight sharing
 
         # Combined attention: layer sharing + head sharing
         self.attention = CombinedSharingAttention(
-            model_args,
-            shared_attention_weights,
-            layer_lora_rank,
-            attention_config,
+            dim=dim,
+            n_heads=n_heads,
+            n_kv_heads=n_kv_heads,
+            head_dim=head_dim,
+            qk_norm=qk_norm,
+            norm_eps=norm_eps,
+            shared_weights=shared_attention_weights,
+            layer_lora_rank=layer_lora_rank,
+            attention_config=attention_config,
         )
 
         self.feed_forward = SharedFeedForward(
-            shared_ffn_weights, model_args.dim, model_args.hidden_dim, layer_lora_rank
+            shared_ffn_weights, dim, hidden_dim, layer_lora_rank
         )
 
-        self.attention_norm = nn.RMSNorm(model_args.dim, eps=model_args.norm_eps)
-        self.ffn_norm = nn.RMSNorm(model_args.dim, eps=model_args.norm_eps)
+        self.attention_norm = RMSNorm(dim, eps=norm_eps)
+        self.ffn_norm = RMSNorm(dim, eps=norm_eps)
 
-        if model_args.depth_init:
+        if depth_init:
             self.weight_init_std = 0.02 / (2 * (layer_id + 1)) ** 0.5
         else:
-            self.weight_init_std = 0.02 / (2 * model_args.n_layers) ** 0.5
+            self.weight_init_std = 0.02 / (2 * n_layers) ** 0.5
 
     def forward(
         self,
@@ -1018,7 +1116,7 @@ class CombinedSharingTransformerBlock(nn.Module):
         self.feed_forward.init_weights(self.weight_init_std)
 
 
-class CombinedSharingAttention(nn.Module):
+class CombinedSharingAttention(Module):
     """Attention with both head sharing AND layer sharing.
 
     Combines:
@@ -1028,33 +1126,46 @@ class CombinedSharingAttention(nn.Module):
     - Per-head LoRA offsets (from attention sharing)
 
     Args:
-        model_args: Model configuration.
+        dim: Model dimension.
+        n_heads: Number of attention heads.
+        n_kv_heads: Number of key/value heads.
+        head_dim: Dimension per attention head.
+        qk_norm: Whether to apply QK normalization.
+        norm_eps: Epsilon for normalization layers.
         shared_weights: Dict with "wq", "wk", "wv", "wo" shared linear layers.
         layer_lora_rank: LoRA rank for per-layer adapters.
         attention_config: AttentionSharingConfig for head sharing settings.
+        attn_type: Attention implementation type.
         use_grouped_mm: Whether to use grouped_mm for LoRA operations.
     """
 
     def __init__(
         self,
-        model_args: Qwen3ModelArgs,
+        *,
+        dim: int,
+        n_heads: int,
+        n_kv_heads: int,
+        head_dim: int,
+        qk_norm: bool,
+        norm_eps: float,
         shared_weights: dict,
         layer_lora_rank: int,
         attention_config,
+        attn_type: str = "sdpa",
         use_grouped_mm: bool = False,
     ):
         super().__init__()
-        self.dim = model_args.dim
-        self.head_dim = model_args.head_dim
-        self.n_heads = model_args.n_heads
+        self.dim = dim
+        self.head_dim = head_dim
+        self.n_heads = n_heads
         self.n_kv_heads = (
-            model_args.n_heads
-            if model_args.n_kv_heads is None
-            else model_args.n_kv_heads
+            n_heads
+            if n_kv_heads is None
+            else n_kv_heads
         )
         self.n_rep = self.n_heads // self.n_kv_heads
         self.scaling = self.head_dim**-0.5
-        self.attn_type = getattr(model_args, "attn_type", "sdpa")
+        self.attn_type = attn_type
 
         # Attention sharing config
         self.head_sharing = attention_config.head_sharing
@@ -1067,26 +1178,26 @@ class CombinedSharingAttention(nn.Module):
         # Shared weights with per-layer LoRA
         self.wq = SharedLinearWithLoRA(
             shared_weights["wq"],
-            model_args.dim,
-            model_args.n_heads * model_args.head_dim,
+            dim,
+            n_heads * head_dim,
             layer_lora_rank,
         )
         self.wk = SharedLinearWithLoRA(
             shared_weights["wk"],
-            model_args.dim,
-            self.n_kv_heads * model_args.head_dim,
+            dim,
+            self.n_kv_heads * head_dim,
             layer_lora_rank,
         )
         self.wv = SharedLinearWithLoRA(
             shared_weights["wv"],
-            model_args.dim,
-            self.n_kv_heads * model_args.head_dim,
+            dim,
+            self.n_kv_heads * head_dim,
             layer_lora_rank,
         )
         self.wo = SharedLinearWithLoRA(
             shared_weights["wo"],
-            model_args.n_heads * model_args.head_dim,
-            model_args.dim,
+            n_heads * head_dim,
+            dim,
             layer_lora_rank,
         )
 
@@ -1117,12 +1228,12 @@ class CombinedSharingAttention(nn.Module):
                 )
 
         # QK norms
-        if model_args.qk_norm:
-            self.q_norm = nn.RMSNorm(
-                self.head_dim, eps=model_args.norm_eps, elementwise_affine=True
+        if qk_norm:
+            self.q_norm = RMSNorm(
+                self.head_dim, eps=norm_eps, elementwise_affine=True
             )
-            self.k_norm = nn.RMSNorm(
-                self.head_dim, eps=model_args.norm_eps, elementwise_affine=True
+            self.k_norm = RMSNorm(
+                self.head_dim, eps=norm_eps, elementwise_affine=True
             )
         else:
             self.q_norm = None

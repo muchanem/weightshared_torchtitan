@@ -21,8 +21,11 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from torchtitan.models.common import Embedding, Linear
+from torchtitan.protocols.module import Module
 
-class FactorizedEmbedding(nn.Module):
+
+class FactorizedEmbedding(Module):
     """Factorized token embedding layer.
 
     Decomposes the embedding matrix into two smaller matrices:
@@ -48,8 +51,12 @@ class FactorizedEmbedding(nn.Module):
         self.d_emb = d_emb
         self.dim = dim
 
-        self.tok_embeddings = nn.Embedding(vocab_size, d_emb)
-        self.tok_embeddings_up = nn.Linear(d_emb, dim, bias=False)
+        self.tok_embeddings = Embedding.Config().build(
+            num_embeddings=vocab_size, embedding_dim=d_emb
+        )
+        self.tok_embeddings_up = Linear.Config().build(
+            in_features=d_emb, out_features=dim
+        )
 
     def forward(self, tokens: torch.Tensor) -> torch.Tensor:
         """Convert token indices to hidden states.
@@ -63,30 +70,13 @@ class FactorizedEmbedding(nn.Module):
         emb = self.tok_embeddings(tokens)
         return self.tok_embeddings_up(emb)
 
-    def init_weights(self, init_std: float) -> None:
-        """Initialize embedding weights with truncated normal distribution.
-
-        Args:
-            init_std: Standard deviation for truncated normal initialization.
-        """
-        cutoff_factor = 3
-        nn.init.trunc_normal_(
-            self.tok_embeddings.weight,
-            mean=0.0,
-            std=init_std,
-            a=-cutoff_factor * init_std,
-            b=cutoff_factor * init_std,
-        )
-        nn.init.trunc_normal_(
-            self.tok_embeddings_up.weight,
-            mean=0.0,
-            std=init_std,
-            a=-cutoff_factor * init_std,
-            b=cutoff_factor * init_std,
-        )
+    def init_weights(self, **kwargs) -> None:
+        """Initialize embedding weights."""
+        self.tok_embeddings.init_weights()
+        self.tok_embeddings_up.init_weights()
 
 
-class FactorizedOutput(nn.Module):
+class FactorizedOutput(Module):
     """Factorized output projection with weight tying to embeddings.
 
     Uses F.linear with transposed embedding weights to project hidden states
@@ -132,33 +122,3 @@ class FactorizedOutput(nn.Module):
         return torch.matmul(h_down, self.embedding.tok_embeddings.weight.t())
 
 
-class StandardOutput(nn.Module):
-    """Standard output projection with weight tying to non-factorized embeddings.
-
-    Uses F.linear with transposed embedding weights for weight tying without
-    meta device issues.
-
-    Args:
-        embedding: The nn.Embedding to tie weights with.
-
-    Example:
-        >>> emb = nn.Embedding(32000, 2048)
-        >>> output = StandardOutput(emb)
-        >>> hidden = torch.randn(2, 128, 2048)
-        >>> logits = output(hidden)  # shape: (2, 128, 32000)
-    """
-
-    def __init__(self, embedding: nn.Embedding):
-        super().__init__()
-        self.embedding = embedding
-
-    def forward(self, h: torch.Tensor) -> torch.Tensor:
-        """Project hidden states to vocabulary logits.
-
-        Args:
-            h: Hidden states of shape (batch_size, seq_len, dim).
-
-        Returns:
-            Logits of shape (batch_size, seq_len, vocab_size).
-        """
-        return F.linear(h, self.embedding.weight)
