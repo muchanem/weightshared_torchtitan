@@ -31,6 +31,7 @@ from torch.nn.attention.flex_attention import BlockMask
 
 from torchtitan.models.common import (
     FlexAttentionWrapper,
+    Linear,
     ScaledDotProductAttentionWrapper,
     VarlenAttentionWrapper,
     VarlenMetadata,
@@ -110,7 +111,7 @@ class TiedLinear(Module):
         >>> wk_tied = TiedLinear(wq_base)  # Shares weights with wq_base
     """
 
-    def __init__(self, source: nn.Linear):
+    def __init__(self, source: nn.Module):
         super().__init__()
         self.source = source
 
@@ -154,8 +155,8 @@ class ScaledLoRAModule(Module):
         # Keep alpha for API compatibility but don't use it
         self.alpha = alpha if alpha is not None else rank * 2
 
-        self.w_a = nn.Linear(in_dim, rank, bias=False)
-        self.w_b = nn.Linear(rank, out_dim, bias=False)
+        self.w_a = Linear.Config().build(in_features=in_dim, out_features=rank)
+        self.w_b = Linear.Config().build(in_features=rank, out_features=out_dim)
 
     def reset_parameters(self) -> None:
         """Initialize LoRA weights. A is kaiming, B is zeros."""
@@ -302,11 +303,11 @@ class SharedAttention(Module):
 
         # QK norms (Qwen3-specific)
         if qk_norm:
-            self.q_norm = RMSNorm(
-                self.head_dim, eps=norm_eps, elementwise_affine=True
+            self.q_norm = RMSNorm.Config(eps=norm_eps).build(
+                normalized_shape=self.head_dim
             )
-            self.k_norm = RMSNorm(
-                self.head_dim, eps=norm_eps, elementwise_affine=True
+            self.k_norm = RMSNorm.Config(eps=norm_eps).build(
+                normalized_shape=self.head_dim
             )
         else:
             self.q_norm = None
@@ -326,7 +327,7 @@ class SharedAttention(Module):
             for weight_group in qkv_sharing:
                 for i, weight_name in enumerate(weight_group):
                     if i == 0:
-                        w_base = nn.Linear(self.dim, base_dim, bias=False)
+                        w_base = Linear.Config().build(in_features=self.dim, out_features=base_dim)
                         setattr(self, _qkv_str_to_attr(weight_name), w_base)
                     else:
                         w = TiedLinear(w_base)
@@ -344,9 +345,9 @@ class SharedAttention(Module):
                 else self.head_dim * self.n_kv_heads
             )
 
-            self.wq_base = nn.Linear(self.dim, q_base_dim, bias=False)
-            self.wk_base = nn.Linear(self.dim, kv_base_dim, bias=False)
-            self.wv_base = nn.Linear(self.dim, kv_base_dim, bias=False)
+            self.wq_base = Linear.Config().build(in_features=self.dim, out_features=q_base_dim)
+            self.wk_base = Linear.Config().build(in_features=self.dim, out_features=kv_base_dim)
+            self.wv_base = Linear.Config().build(in_features=self.dim, out_features=kv_base_dim)
 
         # Create LoRA offset modules
         if two_step:
@@ -367,7 +368,7 @@ class SharedAttention(Module):
                 self.dim, self._n_kv_heads_actual * self.head_dim, rank=rank
             )
 
-        self.wo = nn.Linear(self.n_heads * self.head_dim, self.dim, bias=False)
+        self.wo = Linear.Config().build(in_features=self.n_heads * self.head_dim, out_features=self.dim)
 
         # Inner attention implementation
         match self.attn_type:
@@ -385,7 +386,7 @@ class SharedAttention(Module):
         for attr in ["wq_base", "wk_base", "wv_base"]:
             if hasattr(self, attr):
                 w = getattr(self, attr)
-                if isinstance(w, nn.Linear):
+                if isinstance(w, (nn.Linear, Linear)):
                     nn.init.trunc_normal_(w.weight, mean=0.0, std=0.02)
 
         nn.init.trunc_normal_(self.wo.weight, mean=0.0, std=init_std)
@@ -684,11 +685,11 @@ class SharedAttentionWithLoRA(Module):
 
         # QK norms
         if qk_norm:
-            self.q_norm = RMSNorm(
-                self.head_dim, eps=norm_eps, elementwise_affine=True
+            self.q_norm = RMSNorm.Config(eps=norm_eps).build(
+                normalized_shape=self.head_dim
             )
-            self.k_norm = RMSNorm(
-                self.head_dim, eps=norm_eps, elementwise_affine=True
+            self.k_norm = RMSNorm.Config(eps=norm_eps).build(
+                normalized_shape=self.head_dim
             )
         else:
             self.q_norm = None
@@ -745,32 +746,28 @@ class SharedAttentionWithLoRA(Module):
         if apply_rotary_emb_fn is not None:
             xq, xk = apply_rotary_emb_fn(xq, xk, rope_cache, positions)
 
-        # Repeat KV for GQA
-        if repeat_kv_fn is not None:
-            keys = repeat_kv_fn(xk, self.n_rep)
-            values = repeat_kv_fn(xv, self.n_rep)
-        else:
-            keys = xk
-            values = xv
-
+        # GQA is handled by the attention backend via enable_gqa=True
         xq = xq.transpose(1, 2)
-        xk = keys.transpose(1, 2)
-        xv = values.transpose(1, 2)
+        xk = xk.transpose(1, 2)
+        xv = xv.transpose(1, 2)
 
         match self.attn_type:
             case "flex":
                 assert isinstance(attention_masks, BlockMask)
                 output = self.inner_attention(
-                    xq, xk, xv, block_mask=attention_masks, scale=self.scaling
+                    xq, xk, xv, block_mask=attention_masks, scale=self.scaling,
+                    enable_gqa=True,
                 )
                 output = output.transpose(1, 2).contiguous()
             case "varlen":
                 assert isinstance(attention_masks, VarlenMetadata)
                 output = self.inner_attention(
-                    xq, xk, xv, self.head_dim, attention_masks, scale=self.scaling
+                    xq, xk, xv, self.head_dim, attention_masks, scale=self.scaling,
                 )
             case "sdpa":
-                output = self.inner_attention(xq, xk, xv, scale=self.scaling)
+                output = self.inner_attention(
+                    xq, xk, xv, scale=self.scaling, enable_gqa=True,
+                )
                 output = output.transpose(1, 2).contiguous()
             case _:
                 raise ValueError(f"Unknown attention type: {self.attn_type}")
@@ -837,8 +834,8 @@ class SharedTransformerBlock(Module):
             shared_ffn_weights, dim, hidden_dim, lora_rank
         )
 
-        self.attention_norm = RMSNorm(dim, eps=norm_eps)
-        self.ffn_norm = RMSNorm(dim, eps=norm_eps)
+        self.attention_norm = RMSNorm.Config(eps=norm_eps).build(normalized_shape=dim)
+        self.ffn_norm = RMSNorm.Config(eps=norm_eps).build(normalized_shape=dim)
 
         if depth_init:
             self.weight_init_std = 0.02 / (2 * (layer_id + 1)) ** 0.5
@@ -951,8 +948,8 @@ class AttentionSharingTransformerBlock(Module):
                 dim=dim, hidden_dim=hidden_dim
             )
 
-        self.attention_norm = RMSNorm(dim, eps=norm_eps)
-        self.ffn_norm = RMSNorm(dim, eps=norm_eps)
+        self.attention_norm = RMSNorm.Config(eps=norm_eps).build(normalized_shape=dim)
+        self.ffn_norm = RMSNorm.Config(eps=norm_eps).build(normalized_shape=dim)
 
         if depth_init:
             self.weight_init_std = 0.02 / (2 * (layer_id + 1)) ** 0.5
@@ -1001,9 +998,9 @@ class FeedForward(Module):
 
     def __init__(self, *, dim: int, hidden_dim: int):
         super().__init__()
-        self.w1 = nn.Linear(dim, hidden_dim, bias=False)
-        self.w2 = nn.Linear(hidden_dim, dim, bias=False)
-        self.w3 = nn.Linear(dim, hidden_dim, bias=False)
+        self.w1 = Linear.Config().build(in_features=dim, out_features=hidden_dim)
+        self.w2 = Linear.Config().build(in_features=hidden_dim, out_features=dim)
+        self.w3 = Linear.Config().build(in_features=dim, out_features=hidden_dim)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.w2(F.silu(self.w1(x)) * self.w3(x))
@@ -1081,8 +1078,8 @@ class CombinedSharingTransformerBlock(Module):
             shared_ffn_weights, dim, hidden_dim, layer_lora_rank
         )
 
-        self.attention_norm = RMSNorm(dim, eps=norm_eps)
-        self.ffn_norm = RMSNorm(dim, eps=norm_eps)
+        self.attention_norm = RMSNorm.Config(eps=norm_eps).build(normalized_shape=dim)
+        self.ffn_norm = RMSNorm.Config(eps=norm_eps).build(normalized_shape=dim)
 
         if depth_init:
             self.weight_init_std = 0.02 / (2 * (layer_id + 1)) ** 0.5
@@ -1229,11 +1226,11 @@ class CombinedSharingAttention(Module):
 
         # QK norms
         if qk_norm:
-            self.q_norm = RMSNorm(
-                self.head_dim, eps=norm_eps, elementwise_affine=True
+            self.q_norm = RMSNorm.Config(eps=norm_eps).build(
+                normalized_shape=self.head_dim
             )
-            self.k_norm = RMSNorm(
-                self.head_dim, eps=norm_eps, elementwise_affine=True
+            self.k_norm = RMSNorm.Config(eps=norm_eps).build(
+                normalized_shape=self.head_dim
             )
         else:
             self.q_norm = None
@@ -1343,32 +1340,28 @@ class CombinedSharingAttention(Module):
         if apply_rotary_emb_fn is not None:
             xq, xk = apply_rotary_emb_fn(xq, xk, rope_cache, positions)
 
-        # Repeat KV for GQA
-        if repeat_kv_fn is not None:
-            keys = repeat_kv_fn(xk, self.n_rep)
-            values = repeat_kv_fn(xv, self.n_rep)
-        else:
-            keys = xk
-            values = xv
-
+        # GQA is handled by the attention backend via enable_gqa=True
         xq = xq.transpose(1, 2)
-        xk = keys.transpose(1, 2)
-        xv = values.transpose(1, 2)
+        xk = xk.transpose(1, 2)
+        xv = xv.transpose(1, 2)
 
         match self.attn_type:
             case "flex":
                 assert isinstance(attention_masks, BlockMask)
                 output = self.inner_attention(
-                    xq, xk, xv, block_mask=attention_masks, scale=self.scaling
+                    xq, xk, xv, block_mask=attention_masks, scale=self.scaling,
+                    enable_gqa=True,
                 )
                 output = output.transpose(1, 2).contiguous()
             case "varlen":
                 assert isinstance(attention_masks, VarlenMetadata)
                 output = self.inner_attention(
-                    xq, xk, xv, self.head_dim, attention_masks, scale=self.scaling
+                    xq, xk, xv, self.head_dim, attention_masks, scale=self.scaling,
                 )
             case "sdpa":
-                output = self.inner_attention(xq, xk, xv, scale=self.scaling)
+                output = self.inner_attention(
+                    xq, xk, xv, scale=self.scaling, enable_gqa=True,
+                )
                 output = output.transpose(1, 2).contiguous()
             case _:
                 raise ValueError(f"Unknown attention type: {self.attn_type}")
