@@ -299,18 +299,28 @@ class Qwen3Model(Decoder):
         hidden_dim = config.layer.feed_forward.hidden_dim
         qk_norm = config.layer.attention.q_norm is not None
 
+        # Determine base projection dimensions (grouped when head sharing)
+        attn_cfg = config.attention_sharing
+        if attn_cfg and attn_cfg.head_sharing and attn_cfg.grouping:
+            grouping = attn_cfg.grouping
+            q_base_dim = grouping * head_dim
+            kv_base_dim = grouping * head_dim
+        else:
+            q_base_dim = n_heads * head_dim
+            kv_base_dim = n_kv_heads * head_dim
+
         weight_sets = {}
         for group in layer_groups:
             group_key = tuple(group)
             attention_weights = {
                 "wq": Linear.Config().build(
-                    in_features=config.dim, out_features=n_heads * head_dim
+                    in_features=config.dim, out_features=q_base_dim
                 ),
                 "wk": Linear.Config().build(
-                    in_features=config.dim, out_features=n_kv_heads * head_dim
+                    in_features=config.dim, out_features=kv_base_dim
                 ),
                 "wv": Linear.Config().build(
-                    in_features=config.dim, out_features=n_kv_heads * head_dim
+                    in_features=config.dim, out_features=kv_base_dim
                 ),
                 "wo": Linear.Config().build(
                     in_features=n_heads * head_dim, out_features=config.dim
@@ -417,18 +427,28 @@ class Qwen3Model(Decoder):
         hidden_dim = config.layer.feed_forward.hidden_dim
         qk_norm = config.layer.attention.q_norm is not None
 
+        # Determine base projection dimensions (grouped when head sharing)
+        attn_cfg = config.attention_sharing
+        if attn_cfg and attn_cfg.head_sharing and attn_cfg.grouping:
+            grouping = attn_cfg.grouping
+            q_base_dim = grouping * head_dim
+            kv_base_dim = grouping * head_dim
+        else:
+            q_base_dim = n_heads * head_dim
+            kv_base_dim = n_kv_heads * head_dim
+
         weight_sets = {}
         for group in layer_groups:
             group_key = tuple(group)
             attention_weights = {
                 "wq": Linear.Config().build(
-                    in_features=config.dim, out_features=n_heads * head_dim
+                    in_features=config.dim, out_features=q_base_dim
                 ),
                 "wk": Linear.Config().build(
-                    in_features=config.dim, out_features=n_kv_heads * head_dim
+                    in_features=config.dim, out_features=kv_base_dim
                 ),
                 "wv": Linear.Config().build(
-                    in_features=config.dim, out_features=n_kv_heads * head_dim
+                    in_features=config.dim, out_features=kv_base_dim
                 ),
                 "wo": Linear.Config().build(
                     in_features=n_heads * head_dim, out_features=config.dim

@@ -40,6 +40,7 @@ from torchtitan.models.common import (
 from torchtitan.models.common.attention import AttentionMasksType
 from torchtitan.protocols.module import Module
 from .batched_lora import BatchedLoRAModule
+from .grouped_lora import grouped_attention_head_offset_forward
 
 
 def broadcast_add(
@@ -1172,23 +1173,31 @@ class CombinedSharingAttention(Module):
         self.qkv_sharing = attention_config.qkv_sharing
         self.use_grouped_mm = use_grouped_mm and (self.head_rank > 0 or layer_lora_rank > 0)
 
-        # Shared weights with per-layer LoRA
+        # Compute base projection dimensions (grouped when head sharing)
+        if self.head_sharing:
+            q_base_dim = self.grouping * head_dim
+            kv_base_dim = self.grouping * head_dim
+        else:
+            q_base_dim = n_heads * head_dim
+            kv_base_dim = self.n_kv_heads * head_dim
+
+        # Shared weights with per-layer LoRA (grouped dims when head sharing)
         self.wq = SharedLinearWithLoRA(
             shared_weights["wq"],
             dim,
-            n_heads * head_dim,
+            q_base_dim,
             layer_lora_rank,
         )
         self.wk = SharedLinearWithLoRA(
             shared_weights["wk"],
             dim,
-            self.n_kv_heads * head_dim,
+            kv_base_dim,
             layer_lora_rank,
         )
         self.wv = SharedLinearWithLoRA(
             shared_weights["wv"],
             dim,
-            self.n_kv_heads * head_dim,
+            kv_base_dim,
             layer_lora_rank,
         )
         self.wo = SharedLinearWithLoRA(
@@ -1320,10 +1329,10 @@ class CombinedSharingAttention(Module):
                     wk_offset = self.wk_head_offset(x)
                     wv_offset = self.wv_head_offset(x)
 
-            # Add head offsets
-            xq = xq + wq_offset
-            xk = xk + wk_offset
-            xv = xv + wv_offset
+            # Combine base (may be grouped) with head offsets via broadcast
+            xq = broadcast_add(xq, wq_offset, g=self.grouping)
+            xk = broadcast_add(xk, wk_offset, g=self.grouping)
+            xv = broadcast_add(xv, wv_offset, g=self.grouping)
 
         # Reshape for attention
         xq = xq.view(bsz, seq_len, -1, self.head_dim)
