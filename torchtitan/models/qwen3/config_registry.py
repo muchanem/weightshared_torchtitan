@@ -474,6 +474,7 @@ def _colm_training(model_spec, size):
             data_parallel_shard_degree=1,
         ),
         checkpoint=CheckpointManager.Config(
+            enable=True,
             interval=ckpt_interval,
             last_save_model_only=True,
         ),
