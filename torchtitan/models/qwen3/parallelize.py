@@ -34,7 +34,13 @@ from torchtitan.distributed.activation_checkpoint import apply_ac
 from torchtitan.distributed.compile import apply_compile_sparse
 from torchtitan.distributed.context_parallel import apply_cp_to_attention_module
 from torchtitan.distributed.dual_pipe_v import get_dual_pipe_v_flag
-from torchtitan.models.llama3.parallelize import apply_replicate
+from torch.distributed._composable.replicate_with_fsdp import replicate
+from torch.distributed.fsdp import MixedPrecisionPolicy
+
+from torchtitan.models.llama3.parallelize import (
+    apply_replicate,
+    disable_fsdp_gradient_division,
+)
 from torchtitan.models.llama4.parallelize import apply_fsdp, apply_moe_ep_tp
 from torchtitan.models.qwen3.model import Qwen3Model
 from torchtitan.protocols.model_converter import ModelConvertersContainer
@@ -172,14 +178,43 @@ def parallelize_qwen3(
         if training.enable_cpu_offload:
             logger.info("Applied CPU Offloading to the model")
     elif parallel_dims.dp_replicate_enabled:
-        apply_replicate(
-            model,
-            parallel_dims.get_mesh("dp_replicate"),
-            param_dtype=TORCH_DTYPE_MAP[training.mixed_precision_param],
-            reduce_dtype=TORCH_DTYPE_MAP[training.mixed_precision_reduce],
-        )
+        if ws_active or model.config.enable_weight_tying:
+            # Weight sharing or weight tying creates shared parameters across
+            # sub-modules. The standard per-module replicate() fails because
+            # the same parameter gets registered in multiple groups. Instead,
+            # replicate the whole model at once.
+            _apply_replicate_whole_model(
+                model,
+                parallel_dims.get_mesh("dp_replicate"),
+                param_dtype=TORCH_DTYPE_MAP[training.mixed_precision_param],
+                reduce_dtype=TORCH_DTYPE_MAP[training.mixed_precision_reduce],
+            )
+        else:
+            apply_replicate(
+                model,
+                parallel_dims.get_mesh("dp_replicate"),
+                param_dtype=TORCH_DTYPE_MAP[training.mixed_precision_param],
+                reduce_dtype=TORCH_DTYPE_MAP[training.mixed_precision_reduce],
+            )
 
     return model
+
+
+def _apply_replicate_whole_model(
+    model: nn.Module,
+    dp_mesh: DeviceMesh,
+    param_dtype: torch.dtype,
+    reduce_dtype: torch.dtype,
+):
+    """Apply replicate parallelism for models with shared/tied parameters.
+
+    Unlike per-module replicate(), this wraps the entire model at once to
+    avoid conflicts from shared parameters appearing in multiple groups.
+    """
+    mp_policy = MixedPrecisionPolicy(param_dtype=param_dtype, reduce_dtype=reduce_dtype)
+    replicate(model, mesh=dp_mesh, mp_policy=mp_policy)
+    disable_fsdp_gradient_division(model)
+    logger.info("Applied replicate (whole-model) for weight-shared model")
 
 
 def apply_non_moe_tp(

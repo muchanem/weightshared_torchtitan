@@ -71,9 +71,17 @@ class FactorizedEmbedding(Module):
         return self.tok_embeddings_up(emb)
 
     def init_weights(self, **kwargs) -> None:
-        """Initialize embedding weights."""
+        """Initialize embedding weights.
+
+        Scales the embedding matrix by 1/sqrt(d_emb) so that the tied output
+        path (h @ P.weight @ E.weight.T) produces logits with the correct
+        variance. Without this scaling, the sum over d_emb elements in the
+        final matmul amplifies logit variance by a factor of d_emb.
+        """
         self.tok_embeddings.init_weights()
         self.tok_embeddings_up.init_weights()
+        with torch.no_grad():
+            self.tok_embeddings.weight.div_(self.d_emb**0.5)
 
 
 class FactorizedOutput(Module):

@@ -48,6 +48,16 @@ DATASETS = {
         loader=partial(_load_c4_dataset, split="validation"),
         sample_processor=_process_c4_text,
     ),
+    "hq_data_20bt": DatasetConfig(
+        path="/checkpoint/optim/sanaelotfi/data/hq_data_20bt",
+        loader=lambda path: load_dataset(
+            "json",
+            data_files=[f"{path}/pretrain_20bt.chunk.0{i}.jsonl" for i in range(7)],
+            split="train",
+            streaming=True,
+        ),
+        sample_processor=_process_c4_text,
+    ),
 }
 
 

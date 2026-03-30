@@ -520,6 +520,16 @@ class Qwen3Model(Decoder):
 
         # Init shared weight sets if they exist
         if hasattr(self, '_shared_weight_sets'):
+            # Output projections (wo, w2) need depth-dependent scaling to
+            # prevent residual stream growth. Use the non-depth_init std
+            # (based on total layer count) since shared weights can't have
+            # per-layer init scales.
+            output_init_std = 0.02 / (2 * self.config.n_layers) ** 0.5
             for ws in self._shared_weight_sets.values():
-                for linear in ws.values():
+                for proj_name, linear in ws.items():
                     linear.init_weights()
+                    if proj_name in ('wo', 'w2'):
+                        nn.init.trunc_normal_(
+                            linear.weight, mean=0.0, std=output_init_std
+                        )
+
