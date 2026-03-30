@@ -1019,3 +1019,121 @@ def colm_1b_12_wide_combined() -> Trainer.Config:
         enabled=True, d_emb=288, tie_output=True,
     )
     return _colm_training(spec, "1b")
+
+
+# ============================================================================
+# High embedding proportion configs (#13: 30%, #14: 40% d_emb/dim)
+# Less aggressive factorization — more params in embeddings, fewer in transformer
+# ============================================================================
+
+
+def colm_100m_13_high_emb() -> Trainer.Config:
+    spec = _make_spec(640, 12, 10, 2, 1920, "colm_100m_13_high_emb")
+    spec.model.attention_sharing = AttentionSharingConfig(
+        enabled=True, head_sharing=True, grouping=1, rank=168,
+    )
+    spec.model.layer_sharing = LayerSharingConfig(
+        enabled=True, layer_groups=_seq_pairs(12), lora_rank=248,
+    )
+    spec.model.factorized_embedding = FactorizedEmbeddingConfig(
+        enabled=True, d_emb=192, tie_output=True,
+    )
+    return _colm_training(spec, "100m")
+
+
+def colm_100m_14_very_high_emb() -> Trainer.Config:
+    spec = _make_spec(768, 12, 12, 3, 2304, "colm_100m_14_very_high_emb")
+    spec.model.attention_sharing = AttentionSharingConfig(
+        enabled=True, head_sharing=True, grouping=1, rank=40,
+    )
+    spec.model.layer_sharing = LayerSharingConfig(
+        enabled=True, layer_groups=_seq_pairs(12), lora_rank=56,
+    )
+    spec.model.factorized_embedding = FactorizedEmbeddingConfig(
+        enabled=True, d_emb=304, tie_output=True,
+    )
+    return _colm_training(spec, "100m")
+
+
+def colm_300m_13_high_emb() -> Trainer.Config:
+    spec = _make_spec(1280, 18, 20, 10, 3840, "colm_300m_13_high_emb")
+    spec.model.attention_sharing = AttentionSharingConfig(
+        enabled=True, head_sharing=True, grouping=1, rank=96,
+    )
+    spec.model.layer_sharing = LayerSharingConfig(
+        enabled=True, layer_groups=_seq_pairs(18), lora_rank=144,
+    )
+    spec.model.factorized_embedding = FactorizedEmbeddingConfig(
+        enabled=True, d_emb=384, tie_output=True,
+    )
+    return _colm_training(spec, "300m")
+
+
+def colm_300m_14_very_high_emb() -> Trainer.Config:
+    spec = _make_spec(1344, 18, 21, 7, 4032, "colm_300m_14_very_high_emb")
+    spec.model.attention_sharing = AttentionSharingConfig(
+        enabled=True, head_sharing=True, grouping=1, rank=48,
+    )
+    spec.model.layer_sharing = LayerSharingConfig(
+        enabled=True, layer_groups=_seq_pairs(18), lora_rank=72,
+    )
+    spec.model.factorized_embedding = FactorizedEmbeddingConfig(
+        enabled=True, d_emb=536, tie_output=True,
+    )
+    return _colm_training(spec, "300m")
+
+
+def colm_500m_13_high_emb() -> Trainer.Config:
+    spec = _make_spec(1280, 28, 20, 5, 3840, "colm_500m_13_high_emb")
+    spec.model.attention_sharing = AttentionSharingConfig(
+        enabled=True, head_sharing=True, grouping=1, rank=160,
+    )
+    spec.model.layer_sharing = LayerSharingConfig(
+        enabled=True, layer_groups=_seq_pairs(28), lora_rank=240,
+    )
+    spec.model.factorized_embedding = FactorizedEmbeddingConfig(
+        enabled=True, d_emb=384, tie_output=True,
+    )
+    return _colm_training(spec, "500m")
+
+
+def colm_500m_14_very_high_emb() -> Trainer.Config:
+    spec = _make_spec(1344, 28, 21, 7, 4032, "colm_500m_14_very_high_emb")
+    spec.model.attention_sharing = AttentionSharingConfig(
+        enabled=True, head_sharing=True, grouping=1, rank=104,
+    )
+    spec.model.layer_sharing = LayerSharingConfig(
+        enabled=True, layer_groups=_seq_pairs(28), lora_rank=160,
+    )
+    spec.model.factorized_embedding = FactorizedEmbeddingConfig(
+        enabled=True, d_emb=536, tie_output=True,
+    )
+    return _colm_training(spec, "500m")
+
+
+def colm_1b_13_high_emb() -> Trainer.Config:
+    spec = _make_spec(1792, 32, 28, 7, 5376, "colm_1b_13_high_emb")
+    spec.model.attention_sharing = AttentionSharingConfig(
+        enabled=True, head_sharing=True, grouping=1, rank=168,
+    )
+    spec.model.layer_sharing = LayerSharingConfig(
+        enabled=True, layer_groups=_seq_pairs(32), lora_rank=248,
+    )
+    spec.model.factorized_embedding = FactorizedEmbeddingConfig(
+        enabled=True, d_emb=536, tie_output=True,
+    )
+    return _colm_training(spec, "1b")
+
+
+def colm_1b_14_very_high_emb() -> Trainer.Config:
+    spec = _make_spec(1728, 32, 27, 9, 5184, "colm_1b_14_very_high_emb")
+    spec.model.attention_sharing = AttentionSharingConfig(
+        enabled=True, head_sharing=True, grouping=1, rank=176,
+    )
+    spec.model.layer_sharing = LayerSharingConfig(
+        enabled=True, layer_groups=_seq_pairs(32), lora_rank=264,
+    )
+    spec.model.factorized_embedding = FactorizedEmbeddingConfig(
+        enabled=True, d_emb=688, tie_output=True,
+    )
+    return _colm_training(spec, "1b")
