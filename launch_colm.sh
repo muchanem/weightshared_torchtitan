@@ -24,7 +24,7 @@ mkdir -p /home/sanaelotfi/combined_sharing/colm_logs
 
 export WANDB_API_KEY=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
 export WANDB_TEAM="weight-sharing"
-export WANDB_PROJECT="colm-experiments"
+export WANDB_PROJECT="colm-combined-sharing"
 export WANDB_RUN_NAME="$CONFIG_NAME"
 export TRITON_CACHE_DIR=/checkpoint/optim/sanaelotfi/triton_cache
 export PYTORCH_ALLOC_CONF="expandable_segments:True"
@@ -40,7 +40,7 @@ start_time=$(date +%s)
 
 # Activate environment
 source $HOME/miniconda3/etc/profile.d/conda.sh
-conda activate lingua_251209
+conda activate torchtitan_env
 
 cd "$PROJECT_DIR" || { echo "Failed to change directory to $PROJECT_DIR"; exit 1; }
 

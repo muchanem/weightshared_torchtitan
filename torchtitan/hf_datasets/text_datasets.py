@@ -52,7 +52,7 @@ DATASETS = {
         path="/checkpoint/optim/sanaelotfi/data/hq_data_20bt",
         loader=lambda path: load_dataset(
             "json",
-            data_files=[f"{path}/pretrain_20bt.chunk.0{i}.jsonl" for i in range(7)],
+            data_files=[f"{path}/pretrain_20bt.chunk.0{i}.jsonl" for i in range(8)],
             split="train",
             streaming=True,
         ),

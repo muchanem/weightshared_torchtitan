@@ -20,6 +20,9 @@ from torch.distributed.tensor.parallel import (
     SequenceParallel,
 )
 
+from torch.distributed._composable.replicate_with_fsdp import replicate
+from torch.distributed.fsdp import MixedPrecisionPolicy
+
 from torchtitan.components.quantization.float8 import find_float8_linear_config
 from torchtitan.config import (
     ActivationCheckpointConfig,
@@ -34,9 +37,6 @@ from torchtitan.distributed.activation_checkpoint import apply_ac
 from torchtitan.distributed.compile import apply_compile_sparse
 from torchtitan.distributed.context_parallel import apply_cp_to_attention_module
 from torchtitan.distributed.dual_pipe_v import get_dual_pipe_v_flag
-from torch.distributed._composable.replicate_with_fsdp import replicate
-from torch.distributed.fsdp import MixedPrecisionPolicy
-
 from torchtitan.models.llama3.parallelize import (
     apply_replicate,
     disable_fsdp_gradient_division,
@@ -178,11 +178,12 @@ def parallelize_qwen3(
         if training.enable_cpu_offload:
             logger.info("Applied CPU Offloading to the model")
     elif parallel_dims.dp_replicate_enabled:
-        if ws_active or model.config.enable_weight_tying:
-            # Weight sharing or weight tying creates shared parameters across
-            # sub-modules. The standard per-module replicate() fails because
-            # the same parameter gets registered in multiple groups. Instead,
-            # replicate the whole model at once.
+        # Check if model has shared/tied parameters
+        has_shared_params = (
+            ws_active
+            or (model.config.enable_weight_tying and not model.config.factorized_embedding.enabled)
+        )
+        if has_shared_params:
             _apply_replicate_whole_model(
                 model,
                 parallel_dims.get_mesh("dp_replicate"),

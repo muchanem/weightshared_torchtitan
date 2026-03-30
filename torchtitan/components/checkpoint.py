@@ -22,10 +22,16 @@ import torch
 import torch.distributed as dist
 import torch.distributed.checkpoint as dcp
 import torch.nn as nn
-from torch.distributed.checkpoint import HuggingFaceStorageWriter
-from torch.distributed.checkpoint._consolidate_hf_safetensors import (
-    consolidate_safetensors_files_on_every_rank,
-)
+try:
+    from torch.distributed.checkpoint import HuggingFaceStorageWriter
+except ImportError:
+    HuggingFaceStorageWriter = None
+try:
+    from torch.distributed.checkpoint._consolidate_hf_safetensors import (
+        consolidate_safetensors_files_on_every_rank,
+    )
+except ImportError:
+    consolidate_safetensors_files_on_every_rank = None
 from torch.distributed.checkpoint.staging import DefaultStager, StagingOptions
 from torch.distributed.checkpoint.state_dict import (
     get_model_state_dict,
